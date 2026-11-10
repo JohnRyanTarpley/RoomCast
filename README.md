@@ -13,9 +13,15 @@ speakers at once, in one of three modes:
 ## Running it
 
 1. Install Python 3.10 or newer from python.org (tick "Add python.exe to PATH").
-2. Double-click **Run RoomCast.bat**. The first run creates a private `.venv`
-   folder and downloads the packages in `requirements.txt`; later runs start
-   immediately.
+2. Double-click **RoomCast.exe** (or **Run RoomCast.bat**, which does the same
+   thing). The first run creates a private `.venv` folder and downloads the
+   packages in `requirements.txt`; later runs start immediately, with no
+   console window.
+
+`RoomCast.exe` is a small launcher that runs `Run RoomCast.bat`. It must stay in
+the RoomCast folder. To rebuild it after changing `launcher/RoomCast.cs`, run
+`launcher\build.bat` (no extra tools needed; it uses the C# compiler built into
+Windows). Put a `RoomCast.ico` in `launcher/` before building to give it an icon.
 
 ## Using it
 
