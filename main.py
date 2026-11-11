@@ -1,12 +1,18 @@
+import ctypes
+import os
 import sys
 
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from ui import MainWindow, apply_theme
 
 
 def main():
+    # Own taskbar identity, so Windows shows RoomCast's icon instead of Python's.
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("RoomCast")
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(os.path.join(os.path.dirname(__file__), "assets", "roomcast-icon.svg")))
     apply_theme(app)
     win = MainWindow()
     win.show()

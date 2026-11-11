@@ -9,6 +9,6 @@ if not exist "%CSC%" (
   exit /b 1
 )
 set ICON=
-if exist RoomCast.ico set ICON=/win32icon:RoomCast.ico
+if exist ..\assets\roomcast.ico set ICON=/win32icon:..\assets\roomcast.ico
 "%CSC%" /nologo /target:winexe /optimize+ /out:..\RoomCast.exe %ICON% /reference:System.Windows.Forms.dll RoomCast.cs || exit /b 1
 echo Built %~dp0..\RoomCast.exe

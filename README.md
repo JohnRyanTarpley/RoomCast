@@ -1,7 +1,7 @@
 # RoomCast
 RoomCast is a 3D spatial audio software for connecting multiple Bluetooth speakers to one device to enable surround sound functionality.
 
-![Example Photo v0.1)](image.png)
+![Example Photo v0.1)](assets/image.png)
 
 Play whatever your Windows PC is playing on several independent Bluetooth
 speakers at once, in one of three modes:
