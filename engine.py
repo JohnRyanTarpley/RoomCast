@@ -58,6 +58,7 @@ class SpeakerOut:
         self.peak = 0.0
         self.underruns = 0
         self.beep = None
+        self.t_pull = time.perf_counter()   # last time the device asked for audio
         self.lock = threading.Lock()
 
     def write(self, x):
@@ -111,6 +112,7 @@ class SpeakerOut:
             return out
 
     def pull(self, n_out):
+        self.t_pull = time.perf_counter()
         out = self._read(n_out)
         out = out * (0.0 if self.mute else self.volume)
         beep = self.beep
@@ -125,19 +127,25 @@ class SpeakerOut:
 
 
 class Engine:
+    STALL_S = 1.0       # a speaker that asks for no audio for this long has dropped out
+
     def __init__(self, backend):
         self.backend = backend
         self.running = False
         self.outs: list[SpeakerOut] = []
         self.plan = None
         self.click_on = False
-        self._streams = []
+        self._out_streams = []
+        self._capture = None
         self._filters = []
         self.src_rate = 48000
         self.n_in = 2
 
     # ---- lifecycle ---------------------------------------------------
     def start(self, source: dict, outputs: list, settings: MixSettings):
+        """Start playing. A speaker that cannot be opened is skipped (its
+        index is returned) so the others still play; raises only if no
+        speaker or the source cannot be opened."""
         self.stop()
         self.src_rate = int(source["rate"])
         self.n_in = int(source["channels"])
@@ -146,27 +154,59 @@ class Engine:
         self._filters = [None] * len(self.outs)
         self.apply(settings)
         self.running = True
-        try:
-            for o, dev in zip(self.outs, outputs):
-                self._streams.append(self.backend.open_output(
+        failed, first_error = [], None
+        for i, (o, dev) in enumerate(zip(self.outs, outputs)):
+            try:
+                self._out_streams.append(self.backend.open_output(
                     dev["index"], int(dev["rate"]), int(dev["channels"]), o.pull))
-            self._streams.append(self.backend.open_capture(
-                source["index"], self.src_rate, self.n_in, self._on_capture))
+            except Exception as e:
+                self._out_streams.append(None)
+                failed.append(i)
+                first_error = first_error or e
+        if outputs and len(failed) == len(outputs):
+            self.stop()
+            raise first_error
+        try:
+            self._capture = self.backend.open_capture(
+                source["index"], self.src_rate, self.n_in, self._on_capture)
         except Exception:
             self.stop()
             raise
+        grace = time.perf_counter() + 2.0      # some speakers take a moment to start
+        for o in self.outs:
+            o.t_pull = grace
         threading.Thread(target=self._click_loop, daemon=True).start()
+        return failed
 
     def stop(self):
         self.running = False
-        for s in self._streams:
-            try:
-                self.backend.close(s)
-            except Exception:
-                pass
-        self._streams = []
+        for s in self._out_streams + [self._capture]:
+            self._close(s)
+        self._out_streams = []
+        self._capture = None
         self.outs = []
         self.plan = None
+
+    def _close(self, stream):
+        if stream is not None:
+            try:
+                self.backend.close(stream)
+            except Exception:
+                pass
+
+    # ---- dropout detection --------------------------------------------
+    def stalled(self):
+        """Indices of speakers whose device has stopped asking for audio
+        (switched off, out of range, Bluetooth link lost)."""
+        now = time.perf_counter()
+        return [i for i, (o, s) in enumerate(zip(self.outs, self._out_streams))
+                if s is not None and now - o.t_pull > self.STALL_S]
+
+    def drop(self, i):
+        """Close one speaker's stream; the other speakers keep playing."""
+        if 0 <= i < len(self._out_streams):
+            s, self._out_streams[i] = self._out_streams[i], None
+            self._close(s)
 
     # ---- configuration (safe to call while running) -------------------
     def apply(self, st: MixSettings):

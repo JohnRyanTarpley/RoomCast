@@ -2,3 +2,9 @@ PySide6>=6.5
 numpy>=1.24
 scipy>=1.10
 PyAudioWPatch>=0.2.12.6
+# Windows Bluetooth pairing (Add a Bluetooth speaker)
+winrt-runtime>=4.1
+winrt-Windows.Foundation>=4!10.0.28000
+winrt-Windows.Foundation.Collections>=4!10.0.28000
+winrt-Windows.Devices.Enumeration>=4!10.0.28000
+winrt-Windows.Devices.Bluetooth>=4!10.0.28000

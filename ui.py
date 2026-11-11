@@ -3,19 +3,23 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QByteArray, QEvent, QPoint, QRect, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QPainter, QPalette
 from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComboBox,
-                               QDoubleSpinBox, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-                               QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-                               QProgressBar, QPushButton, QRadioButton, QSlider, QSpinBox,
-                               QSplitter, QStackedWidget, QTableWidget, QVBoxLayout, QWidget)
+                               QDoubleSpinBox, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView,
+                               QLabel, QLayout, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+                               QFrame, QProgressBar, QPushButton, QRadioButton, QScrollArea,
+                               QSizePolicy, QSlider,
+                               QSpinBox, QSplitter, QStackedWidget, QTableWidget, QVBoxLayout,
+                               QWidget)
 
 import dsp
+from connection import DeviceMonitor, PairDialog, bt
 from engine import Engine, MixSettings, SpeakerSettings
 from room_view import LISTENER, RoomView
 
@@ -64,6 +68,10 @@ def apply_theme(app):
             background: #3b82f6; border-color: #9cc2ff; }
         QProgressBar { border: 1px solid #343a44; border-radius: 3px; background: #171a1f; }
         QProgressBar::chunk { background: #51cf66; }
+        QSplitter::handle { background: #262b33; }
+        QSplitter::handle:hover { background: #3b82f6; }
+        QSplitter::handle:horizontal { width: 6px; }
+        QSplitter::handle:vertical { height: 6px; }
     """)
 
 
@@ -72,6 +80,148 @@ def hint(text):
     lab.setWordWrap(True)
     lab.setProperty("hint", True)
     return lab
+
+
+GREEN, AMBER, RED, GREY = "#51cf66", "#fcc419", "#ff6b6b", "#8b94a3"
+
+
+class ElidedCheckBox(QCheckBox):
+    """Check box whose label shortens with "…" to fit, so its column can be resized freely."""
+
+    def __init__(self, text):
+        super().__init__(text)
+        self.full = text
+        self.setToolTip(text)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.setMinimumWidth(60)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        room = max(20, self.width() - 24)        # minus the tick box itself
+        self.setText(self.fontMetrics().elidedText(self.full, Qt.ElideRight, room))
+
+
+def hbox():
+    """A horizontal row packed into its own widget: returns (widget, layout)."""
+    w = QWidget()
+    lay = QHBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    return w, lay
+
+
+class FlowLayout(QLayout):
+    """Lays widgets out left to right and wraps onto a new line when out of room."""
+
+    def __init__(self, parent=None, hspace=14, vspace=6):
+        super().__init__(parent)
+        self.setContentsMargins(0, 4, 0, 0)
+        self._items, self._h, self._v = [], hspace, vspace
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._place(QRect(0, 0, width, 0), apply=False)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._place(rect, apply=True)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for it in self._items:
+            size = size.expandedTo(it.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _place(self, rect, apply):
+        m = self.contentsMargins()
+        r = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, line = r.x(), r.y(), 0
+        for it in self._items:
+            hint = it.sizeHint()
+            if x > r.x() and x + hint.width() > r.right() + 1:
+                x, y, line = r.x(), y + line + self._v, 0
+            if apply:
+                it.setGeometry(QRect(QPoint(x, y), hint))
+            x += hint.width() + self._h
+            line = max(line, hint.height())
+        return y + line - rect.y() + m.bottom()
+
+
+def split(orientation, *widgets, sizes=None):
+    s = QSplitter(orientation)
+    s.setChildrenCollapsible(False)
+    for w in widgets:
+        s.addWidget(w)
+    if sizes:
+        s.setSizes(sizes)
+    return s
+
+
+class SpeakerRow(QWidget):
+    """One speaker in the device list: tick box, battery, connection state and
+    a Reconnect button for Bluetooth speakers."""
+
+    def __init__(self, name, checked, on_toggle, on_reconnect):
+        super().__init__()
+        self.name = name
+        g = QGridLayout(self)
+        g.setContentsMargins(6, 4, 6, 4)
+        g.setHorizontalSpacing(6)
+        g.setVerticalSpacing(1)
+        self.check = ElidedCheckBox(name)
+        self.check.setChecked(checked)
+        self.check.toggled.connect(lambda on: on_toggle(name, on))
+        g.addWidget(self.check, 0, 0)
+        self.battery = QLabel()
+        g.addWidget(self.battery, 0, 1, Qt.AlignRight)
+        self.state = QLabel()
+        self.state.setWordWrap(True)
+        self.state.setContentsMargins(21, 0, 0, 0)
+        f = self.state.font()
+        f.setPointSizeF(f.pointSizeF() * 0.9)
+        self.state.setFont(f)
+        g.addWidget(self.state, 1, 0)
+        self.btn = QPushButton("Reconnect")
+        self.btn.setToolTip("Ask Windows to connect this speaker again.")
+        self.btn.clicked.connect(lambda: on_reconnect(name))
+        self.btn.hide()
+        g.addWidget(self.btn, 1, 1, Qt.AlignRight)
+        g.setColumnStretch(0, 1)
+
+    def set_state(self, text, color, reconnect=False, reconnect_enabled=True):
+        self.state.setText("<span style='color:%s'>●</span> %s" % (color, text))
+        self.btn.setVisible(reconnect)
+        self.btn.setEnabled(reconnect_enabled)
+
+    def set_battery(self, pct):
+        if pct is None:
+            self.battery.clear()
+            self.battery.setToolTip("")
+            return
+        color = RED if pct <= 20 else (AMBER if pct <= 40 else None)
+        text = "🔋 %d%%" % pct
+        self.battery.setText("<span style='color:%s'>%s</span>" % (color, text) if color else text)
+        self.battery.setToolTip("Battery level reported by the speaker")
 
 
 class BandView(QWidget):
@@ -114,7 +264,6 @@ class MainWindow(QMainWindow):
     def __init__(self, backend=None):
         super().__init__()
         self.setWindowTitle("RoomCast – multi-speaker Bluetooth audio")
-        self.resize(1240, 800)
         self.speakers: dict[str, SpeakerCfg] = {}
         self.active: list[SpeakerCfg] = []
         self.checked: list[str] = []
@@ -122,10 +271,20 @@ class MainWindow(QMainWindow):
         self.listener = [0.0, 0.0, 1.2]
         self.mode = "sync"
         self.opts = {"master": 0.8, "base_ms": 120, "focus": 2.0, "delay_comp": True,
-                     "level_comp": True, "upmix": True, "source": ""}
+                     "level_comp": True, "upmix": True, "source": "", "auto_reconnect": True}
         self.outputs, self.sources = [], []
         self._loading = False
         self._load()
+
+        # connection tracking
+        self.endpoints = {}          # endpoint name -> info from bluetooth.list_endpoints()
+        self.battery = {}            # container id -> battery %
+        self.rows = {}               # speaker name -> SpeakerRow
+        self.dropped = {}            # speaker name -> {"t", "gone", "hold"}: left out until it returns
+        self.drop_history = {}       # speaker name -> recent drop times (for back-off)
+        self.reconnecting = {}       # speaker name -> time a manual Reconnect was pressed
+        self.reconnect_failed = {}   # speaker name -> time it failed
+        self.last_auto = {}          # speaker name -> time of last automatic reconnect attempt
 
         self.backend, self.backend_error = backend, ""
         if backend is None:
@@ -137,10 +296,17 @@ class MainWindow(QMainWindow):
         self.engine = Engine(self.backend)
 
         self._build()
+        self._restart_timer = QTimer(self)
+        self._restart_timer.setSingleShot(True)
+        self._restart_timer.timeout.connect(self._auto_restart)
         self.refresh_devices()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(60)
+        self.monitor = DeviceMonitor()
+        self.monitor.updated.connect(self._on_monitor)
+        self.monitor.reconnect_done.connect(self._on_reconnect_done)
+        self.monitor.start()
         if self.backend is None:
             self.status.setText("Audio system unavailable: " + self.backend_error)
 
@@ -166,21 +332,73 @@ class MainWindow(QMainWindow):
             pass
 
     def closeEvent(self, e):
+        self.monitor.stop()
         self.engine.stop()
+        self._save_layout()
         self._save()
         e.accept()
 
+    def _save_layout(self):
+        b64 = lambda ba: bytes(ba.toBase64()).decode("ascii")
+        self.opts["layout"] = {"window": b64(self.saveGeometry()),
+                               **{k: b64(s.saveState()) for k, s in self.splitters.items()}}
+
+    def _restore_layout(self):
+        saved = self.opts.get("layout") or {}
+        restore = lambda s: QByteArray.fromBase64(s.encode("ascii"))
+        try:
+            if not self.restoreGeometry(restore(saved["window"])):
+                raise ValueError
+        except Exception:
+            self.resize(1240, 800)
+        for k, s in self.splitters.items():
+            if k in saved:
+                try:
+                    s.restoreState(restore(saved[k]))
+                except Exception:
+                    pass
+
+    def eventFilter(self, obj, e):
+        if e.type() == QEvent.Resize:
+            try:
+                if obj is self.dev_list.viewport():
+                    self._fit_rows()
+            except RuntimeError:        # window is being torn down
+                pass
+        return super().eventFilter(obj, e)
+
+    def _fit_rows(self):
+        """Give each speaker row the height it needs at the list's current width
+        (status text wraps onto more lines when the column is narrow)."""
+        w = self.dev_list.viewport().width()
+        for i in range(self.dev_list.count()):
+            it = self.dev_list.item(i)
+            row = self.dev_list.itemWidget(it)
+            if row is not None:
+                h = row.layout().totalHeightForWidth(w)
+                it.setSizeHint(QSize(w, h if h > 0 else row.sizeHint().height()))
+
     # ---- UI construction ---------------------------------------------
     def _build(self):
-        # left column
-        left = QVBoxLayout()
+        # left column: speaker list | (source, mode, output) in a draggable split,
+        # with Start and the status line always at the bottom
+        settings = QVBoxLayout()
+        settings.setContentsMargins(0, 0, 0, 0)
         g = QGroupBox("1 · Speakers")
         v = QVBoxLayout(g)
-        v.addWidget(hint("Pair and connect each speaker in Windows Bluetooth settings, "
-                         "then press Refresh and tick the ones to use."))
+        v.addWidget(hint("Tick the speakers to use. Paired Bluetooth speakers that are switched off "
+                         "are listed too, and join in automatically when they connect."))
         self.dev_list = QListWidget()
-        self.dev_list.itemChanged.connect(self._on_checked)
+        self.dev_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self.dev_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.dev_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.dev_list.setMinimumHeight(70)
+        self.dev_list.viewport().installEventFilter(self)
         v.addWidget(self.dev_list, 1)
+        b = QPushButton("Add a Bluetooth speaker…")
+        b.setToolTip("Find and pair a new speaker without leaving RoomCast.")
+        b.clicked.connect(self._add_speaker)
+        v.addWidget(b)
         row = QHBoxLayout()
         b = QPushButton("Refresh")
         b.clicked.connect(self.refresh_devices)
@@ -189,7 +407,14 @@ class MainWindow(QMainWindow):
         b.clicked.connect(lambda: self._open_settings("ms-settings:bluetooth"))
         row.addWidget(b)
         v.addLayout(row)
-        left.addWidget(g, 1)
+        cb = QCheckBox("Auto-reconnect ticked speakers")
+        cb.setToolTip("While RoomCast is playing, it asks Windows to reconnect any ticked Bluetooth "
+                      "speaker that has disconnected, every 30 seconds.")
+        cb.setChecked(bool(self.opts["auto_reconnect"]))
+        cb.toggled.connect(lambda on: self.opts.__setitem__("auto_reconnect", on))
+        v.addWidget(cb)
+        speakers_box = g
+        left = settings
 
         g = QGroupBox("2 · Audio source (what the PC is playing)")
         v = QVBoxLayout(g)
@@ -239,17 +464,33 @@ class MainWindow(QMainWindow):
         row.addStretch()
         v.addLayout(row)
         left.addWidget(g)
+        left.addStretch()
+        settings_w = QWidget()
+        settings_w.setLayout(settings)
+        settings_scroll = QScrollArea()       # scrolls when the window is short
+        settings_scroll.setWidget(settings_w)
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setFrameShape(QFrame.NoFrame)
+        settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        settings_scroll.setMinimumHeight(80)
+        self.left_split = split(Qt.Vertical, speakers_box, settings_scroll, sizes=[400, 340])
+        self.left_split.setStretchFactor(0, 1)
 
+        bottom = QVBoxLayout()
+        bottom.setContentsMargins(0, 0, 0, 0)
+        bottom.addWidget(self.left_split, 1)
         self.start_btn = QPushButton("Start")
         self.start_btn.setObjectName("start")
         self.start_btn.setCheckable(True)
         self.start_btn.clicked.connect(self._toggle)
-        left.addWidget(self.start_btn)
+        bottom.addWidget(self.start_btn)
         self.status = hint("Stopped")
-        left.addWidget(self.status)
+        bottom.addWidget(self.status)
         lw = QWidget()
-        lw.setLayout(left)
-        lw.setFixedWidth(340)
+        lw.setLayout(bottom)
+        # never narrower than the settings need, so no label gets cut off
+        sb = settings_scroll.verticalScrollBar().sizeHint().width()
+        lw.setMinimumWidth(max(260, settings_w.minimumSizeHint().width() + sb + 4))
 
         # mode pages
         self.stack = QStackedWidget()
@@ -270,23 +511,22 @@ class MainWindow(QMainWindow):
         for c, w in [(1, 170), (2, 100), (3, 50), (4, 70), (5, 150)]:
             self.table.setColumnWidth(c, w)
         v.addWidget(self.table)
-        row = QHBoxLayout()
         self.click = QCheckBox("Calibration click (replaces the music)")
         self.click.toggled.connect(lambda on: setattr(self.engine, "click_on", on))
-        row.addWidget(self.click)
-        row.addWidget(hint("Bluetooth speakers each lag by a different amount. With the click on, "
-                           "add Delay to the speakers that click first until you hear one click."), 1)
-        v.addLayout(row)
+        v.addWidget(self.click)
+        v.addWidget(hint("Bluetooth speakers each lag by a different amount. With the click on, "
+                         "add Delay to the speakers that click first until you hear one click."))
 
-        split = QSplitter(Qt.Vertical)
-        split.addWidget(self.stack)
-        split.addWidget(g)
-        split.setSizes([520, 240])
+        self.right_split = split(Qt.Vertical, self.stack, g, sizes=[520, 240])
+        self.right_split.setStretchFactor(0, 1)
+        self.main_split = split(Qt.Horizontal, lw, self.right_split, sizes=[340, 900])
+        self.main_split.setStretchFactor(1, 1)
         central = QWidget()
         lay = QHBoxLayout(central)
-        lay.addWidget(lw)
-        lay.addWidget(split, 1)
+        lay.addWidget(self.main_split)
         self.setCentralWidget(central)
+        self.splitters = {"main": self.main_split, "left": self.left_split, "right": self.right_split}
+        self._restore_layout()
 
     def _dspin(self, lo, hi, val, step=0.1, suffix=" m"):
         s = QDoubleSpinBox()
@@ -306,7 +546,10 @@ class MainWindow(QMainWindow):
         self.room_view.selected.connect(lambda i: self._show_selected())
         v.addWidget(self.room_view, 1)
 
-        row = QHBoxLayout()
+        # Controls wrap onto more lines when the window is narrow.
+        controls = QWidget()
+        flow = FlowLayout(controls)
+        row_w, row = hbox()
         row.addWidget(QLabel("Room W × D × H"))
         self.room_spins = []
         for i in range(3):
@@ -314,7 +557,8 @@ class MainWindow(QMainWindow):
             s.valueChanged.connect(lambda val, i=i: self._room_changed(i, val))
             self.room_spins.append(s)
             row.addWidget(s)
-        row.addSpacing(16)
+        flow.addWidget(row_w)
+        row_w, row = hbox()
         self.sel_label = QLabel("Listener  X / Y / Z")
         row.addWidget(self.sel_label)
         self.pos_spins = []
@@ -323,13 +567,11 @@ class MainWindow(QMainWindow):
             s.valueChanged.connect(lambda val, i=i: self._pos_spin(i, val))
             self.pos_spins.append(s)
             row.addWidget(s)
-        row.addStretch()
+        flow.addWidget(row_w)
         b = QPushButton("Arrange in a circle")
         b.clicked.connect(lambda: self._arrange())
-        row.addWidget(b)
-        v.addLayout(row)
+        flow.addWidget(b)
 
-        row = QHBoxLayout()
         for key, text, tip in [
             ("delay_comp", "Distance delay", "Delay nearer speakers so sound from every speaker "
                                              "reaches the listener at the same moment."),
@@ -341,8 +583,8 @@ class MainWindow(QMainWindow):
             cb.setChecked(bool(self.opts[key]))
             cb.setToolTip(tip)
             cb.toggled.connect(lambda on, key=key: self._opt(key, on))
-            row.addWidget(cb)
-        row.addSpacing(16)
+            flow.addWidget(cb)
+        row_w, row = hbox()
         row.addWidget(QLabel("Focus"))
         fs = QSlider(Qt.Horizontal)
         fs.setRange(5, 80)
@@ -352,8 +594,8 @@ class MainWindow(QMainWindow):
                       "sticks to the speakers nearest its direction.")
         fs.valueChanged.connect(lambda x: self._opt("focus", x / 10))
         row.addWidget(fs)
-        row.addStretch()
-        v.addLayout(row)
+        flow.addWidget(row_w)
+        v.addWidget(controls)
         return w
 
     def _frequency_page(self):
@@ -369,7 +611,8 @@ class MainWindow(QMainWindow):
         self.band_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         v.addWidget(self.band_table, 1)
         row = QHBoxLayout()
-        b = QPushButton("Split evenly (lows → highs, in list order)")
+        b = QPushButton("Split evenly")
+        b.setToolTip("Give each speaker an equal slice, lows → highs, in list order.")
         b.clicked.connect(self._auto_bands)
         row.addWidget(b)
         row.addWidget(hint("Bands may overlap or leave gaps. 20 Hz – 20000 Hz means the full range."), 1)
@@ -399,9 +642,54 @@ class MainWindow(QMainWindow):
         except Exception:
             QMessageBox.information(self, "RoomCast", "This button only works on Windows.")
 
+    # Speakers are matched by their Windows name ("Speakers (JBL Flip 5)"), which is the same
+    # in the audio library's device list and in bluetooth.list_endpoints().
+
+    def _sync_endpoints(self):
+        if bt is None:
+            return
+        try:
+            bt.com_init(single_threaded=True)
+            self.endpoints = self._index(bt.list_endpoints())
+            if not self.battery:
+                self.battery = bt.battery_levels()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _index(endpoints):
+        res = {}
+        for e in endpoints:            # if two share a name, prefer the connected one
+            if e["name"] not in res or e["connected"]:
+                res[e["name"]] = e
+        return res
+
+    def _is_hands_free(self, name):
+        e = self.endpoints.get(name)
+        return e["hands_free"] if e else "hands-free" in name.lower()
+
+    def _playable(self):
+        """Names the audio library can open right now (hands-free outputs excluded)."""
+        return [d["name"] for d in self.outputs if not self._is_hands_free(d["name"])]
+
+    def _list_names(self):
+        names = self._playable()
+        for e in self.endpoints.values():     # connected since the last refresh, or paired but off
+            if not e["hands_free"] and e["name"] not in names:
+                names.append(e["name"])
+        return names
+
+    def _hands_free_only(self, e):
+        """True if the speaker's normal output is down but its call-mode output is up."""
+        c = e.get("container")
+        return bool(c) and not c.startswith("{00000000-") and any(
+            x["hands_free"] and x["connected"] and x["container"] == c for x in self.endpoints.values())
+
     def refresh_devices(self):
-        if self.engine.running:
-            self._stop()
+        """Re-scan devices. If playback is on, it continues with the new list."""
+        resume = self.start_btn.isChecked()
+        self.engine.stop()
+        self._sync_endpoints()
         self.outputs, self.sources = [], []
         if self.backend is not None:
             try:
@@ -412,11 +700,15 @@ class MainWindow(QMainWindow):
                 self.status.setText("Could not list audio devices: %s" % e)
         self._loading = True
         self.dev_list.clear()
-        for d in self.outputs:
-            it = QListWidgetItem(d["name"])
-            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
-            it.setCheckState(Qt.Checked if d["name"] in self.checked else Qt.Unchecked)
+        self.rows = {}
+        for name in self._list_names():
+            row = SpeakerRow(name, name in self.checked, self._on_toggle, self._reconnect)
+            it = QListWidgetItem()
+            it.setFlags(Qt.ItemIsEnabled)
+            it.setSizeHint(row.sizeHint())
             self.dev_list.addItem(it)
+            self.dev_list.setItemWidget(it, row)
+            self.rows[name] = row
         self.src_combo.clear()
         for s in self.sources:
             self.src_combo.addItem("%s  (%d ch, %d Hz)" % (s["name"].replace(" [Loopback]", ""),
@@ -430,22 +722,31 @@ class MainWindow(QMainWindow):
             self.src_combo.setCurrentIndex(names.index(want))
         self._loading = False
         self._rebuild_active()
+        if resume:
+            self._start(quiet=True)
+        self._update_rows()
 
     def _on_source(self, i):
         if not self._loading and 0 <= i < len(self.sources):
             self.opts["source"] = self.sources[i]["name"]
             self._restart_if_running()
 
-    def _on_checked(self, _):
+    def _on_toggle(self, name, on):
         if self._loading:
             return
-        self.checked = [self.dev_list.item(i).text() for i in range(self.dev_list.count())
-                        if self.dev_list.item(i).checkState() == Qt.Checked]
-        self._rebuild_active()
-        self._restart_if_running()
+        if on and name not in self.checked:
+            self.checked.append(name)
+        elif not on and name in self.checked:
+            self.checked.remove(name)
+        self.dropped.pop(name, None)
+        if self.start_btn.isChecked():
+            self._schedule_restart(150)     # also picks up speakers connected since the last refresh
+        else:
+            self._rebuild_active()
+        self._update_rows()
 
     def _rebuild_active(self):
-        present = [d["name"] for d in self.outputs]
+        present = [n for n in self._playable() if n not in self.dropped]
         self.active = []
         for name in [n for n in present if n in self.checked]:
             cfg = self.speakers.get(name)
@@ -619,55 +920,223 @@ class MainWindow(QMainWindow):
         else:
             self._stop()
 
-    def _fail(self, msg):
+    def _fail(self, msg, quiet=False):
         self.start_btn.setChecked(False)
         self.start_btn.setText("Start")
-        QMessageBox.warning(self, "RoomCast", msg)
+        if quiet:
+            self.status.setText("Stopped: " + msg.split("\n")[0])
+        else:
+            QMessageBox.warning(self, "RoomCast", msg)
 
-    def _start(self):
+    def _set_running_ui(self):
+        self.start_btn.setChecked(True)
+        self.start_btn.setText("Stop")
+
+    def _start(self, quiet=False):
+        """quiet=True for automatic restarts: report problems in the status line, no pop-ups."""
         if self.backend is None:
-            return self._fail("The Windows audio system could not be loaded:\n" + self.backend_error)
+            return self._fail("The Windows audio system could not be loaded:\n" + self.backend_error, quiet)
         if not self.active:
-            return self._fail("Tick at least one speaker first.")
+            if not self.checked:
+                return self._fail("Tick at least one speaker first.", quiet)
+            self._set_running_ui()      # keep "on" and wait for a ticked speaker to connect
+            self.status.setText("Waiting for a ticked speaker to connect…")
+            self._update_rows()
+            return
         i = self.src_combo.currentIndex()
         if not 0 <= i < len(self.sources):
-            return self._fail("No audio source found. Press Refresh.")
+            return self._fail("No audio source found. Press Refresh.", quiet)
         src = self.sources[i]
         if any(src["name"].startswith(s.name) for s in self.active):
             return self._fail(
                 "The audio source is also ticked as a speaker, which would create a feedback loop.\n\n"
                 "Set Windows to play through a device you are NOT using as a speaker (for example the "
                 "PC's built-in output turned all the way down, or a virtual cable), choose that device "
-                "as the source, and try again.")
+                "as the source, and try again.", quiet)
         by_name = {d["name"]: d for d in self.outputs}
         try:
-            self.engine.start(src, [by_name[s.name] for s in self.active], self.mix())
+            failed = self.engine.start(src, [by_name[s.name] for s in self.active], self.mix())
         except Exception as e:
+            if quiet:                   # e.g. every speaker vanished mid-restart: retry shortly
+                for s in self.active:
+                    self._mark_dropped(s.name)
+                self._set_running_ui()
+                self.status.setText("Could not open the speakers, retrying…")
+                self._schedule_restart(3000)
+                return
             return self._fail("Could not open the audio devices:\n%s\n\nPress Refresh and check that "
                               "every ticked speaker is still connected." % e)
         self.engine.click_on = self.click.isChecked()
-        self.start_btn.setChecked(True)
-        self.start_btn.setText("Stop")
+        self._set_running_ui()
+        if failed:                      # play on the others; leave these out until they recover
+            for k in failed:
+                self._mark_dropped(self.active[k].name)
+            self._schedule_restart(1500)
+        self._update_rows()
         self._save()
 
     def _stop(self):
+        self._restart_timer.stop()
         self.engine.stop()
+        self.dropped.clear()
         self.start_btn.setChecked(False)
         self.start_btn.setText("Start")
         self.status.setText("Stopped")
         for m in getattr(self, "meters", []):
             m.setValue(0)
+        self._update_rows()
 
     def _restart_if_running(self):
+        if self.start_btn.isChecked():
+            self._schedule_restart(150)
+
+    def _schedule_restart(self, ms):
+        """Restart playback (re-scanning devices) shortly. Repeated calls are merged."""
+        self._restart_timer.start(ms)
+
+    def _auto_restart(self):
+        if self.start_btn.isChecked():
+            self.refresh_devices()
+
+    # ---- dropouts and reconnecting --------------------------------------
+    def _mark_dropped(self, name):
+        """Leave a speaker out of playback until it comes back. A speaker that keeps
+        dropping out is left out for longer each time (10 s, 20 s, … up to 2 min)."""
+        now = time.monotonic()
+        hist = [t for t in self.drop_history.get(name, []) if now - t < 300] + [now]
+        self.drop_history[name] = hist
+        self.dropped[name] = {"t": now, "gone": False, "hold": min(10 * 2 ** (len(hist) - 1), 120)}
+
+    def _check_dropouts(self):
+        now = time.monotonic()
         if self.engine.running:
-            self._stop()
-            self._start()
+            stalled = self.engine.stalled()
+            for i in stalled:
+                name = self.engine.outs[i].name
+                self.engine.drop(i)
+                self._mark_dropped(name)
+            if stalled:
+                self._schedule_restart(1500)    # re-plan without them (surround re-pans)
+                self._update_rows()
+        for name, d in list(self.dropped.items()):
+            if not d["gone"] and now - d["t"] > d["hold"]:
+                del self.dropped[name]          # never actually disconnected: try it again
+                if self.start_btn.isChecked():
+                    self._schedule_restart(500)
+
+    def _on_monitor(self, endpoints, battery):
+        old = self.endpoints
+        self.endpoints, self.battery = self._index(endpoints), battery
+        now = time.monotonic()
+
+        def shape(d):
+            return {(n, e["connected"], e["hands_free"]) for n, e in d.items()}
+
+        def up(d):
+            return {n for n, e in d.items() if e["connected"] and not e["hands_free"]}
+
+        returned = False
+        for name, d in list(self.dropped.items()):
+            e = self.endpoints.get(name)
+            if e is None:
+                continue                        # no connection info: the time-out retries it
+            if not e["connected"]:
+                d["gone"] = True
+            elif d["gone"]:
+                del self.dropped[name]          # back again
+                returned = True
+        for name, t in list(self.reconnecting.items()):
+            e = self.endpoints.get(name)
+            if e is not None and e["connected"]:
+                del self.reconnecting[name]
+            elif now - t > 20:
+                del self.reconnecting[name]
+                self.reconnect_failed[name] = now
+
+        if shape(old) != shape(self.endpoints):
+            if self.start_btn.isChecked():
+                if returned or (up(old) ^ up(self.endpoints)) & set(self.checked):
+                    self._schedule_restart(2000)    # let a fresh Bluetooth link settle first
+                elif set(self.endpoints) - set(old):
+                    self._schedule_restart(2000)    # new speaker: show it in the list
+            else:
+                self.refresh_devices()
+
+        if self.start_btn.isChecked() and self.opts["auto_reconnect"]:
+            for name in self.checked:
+                e = self.endpoints.get(name)
+                if (e and e["bluetooth"] and not e["connected"] and name not in self.reconnecting
+                        and now - self.last_auto.get(name, -1e9) > 30):
+                    self.last_auto[name] = now
+                    self.monitor.request_reconnect(e["id"], name)
+        self._update_rows()
+
+    def _reconnect(self, name):
+        e = self.endpoints.get(name)
+        if e is None:
+            return
+        self.reconnecting[name] = time.monotonic()
+        self.reconnect_failed.pop(name, None)
+        self.monitor.request_reconnect(e["id"], name)
+        self._update_rows()
+
+    def _on_reconnect_done(self, name, ok, message):
+        if not ok and name in self.reconnecting:
+            del self.reconnecting[name]
+            self.reconnect_failed[name] = time.monotonic()
+            self._update_rows()
+        if ok:
+            self.monitor.poll_now()
+
+    def _add_speaker(self):
+        dlg = PairDialog(self)
+        dlg.paired.connect(self.monitor.poll_now)
+        dlg.exec()
+        self.monitor.poll_now()
+
+    def _row_state(self, name):
+        """(text, colour, show Reconnect, Reconnect enabled) for one speaker row."""
+        e = self.endpoints.get(name)
+        is_bt = bool(e and e["bluetooth"])
+        now = time.monotonic()
+        if e is not None and not e["connected"]:
+            if name in self.reconnecting:
+                return "Reconnecting…", AMBER, True, False
+            if now - self.reconnect_failed.get(name, -1e9) < 30:
+                return "Couldn't reconnect. Is it switched on and nearby?", RED, True, True
+            if self._hands_free_only(e):
+                return ("Connected in hands-free (call) mode only, which sounds poor. "
+                        "Press Reconnect."), AMBER, True, True
+            if self.start_btn.isChecked() and name in self.checked and self.opts["auto_reconnect"]:
+                return "Disconnected. RoomCast keeps trying to reconnect it.", RED, True, True
+            return "Disconnected (paired). Switch it on or press Reconnect.", GREY, True, True
+        if name in self.dropped:
+            return "Dropped out. It rejoins automatically when it's back.", AMBER, is_bt, True
+        if self.engine.running and any(o.name == name for o in self.engine.outs):
+            return "Playing", GREEN, False, True
+        if name in self.checked and self.start_btn.isChecked():
+            return "Connected. Joining…", AMBER, False, True
+        return "Connected" + (" · Bluetooth" if is_bt else ""), GREEN if is_bt else GREY, False, True
+
+    def _update_rows(self):
+        for name, row in self.rows.items():
+            text, color, show, enabled = self._row_state(name)
+            row.set_state(text, color, show, enabled)
+            e = self.endpoints.get(name)
+            row.set_battery(self.battery.get(e["container"]) if e and e["bluetooth"] else None)
+        self._fit_rows()
 
     def _tick(self):
+        self._tick_n = getattr(self, "_tick_n", 0) + 1
+        if self._tick_n % 8 == 0:               # about twice a second
+            self._check_dropouts()
         if not self.engine.running:
             return
         for m, lv in zip(self.meters, self.engine.levels()):
             db = 20 * np.log10(max(lv, 1e-4))
             m.setValue(int(np.clip((db + 60) / 60 * 100, 0, 100)))
-        self.status.setText("Running · %d speaker(s) · source %d ch @ %d Hz · dropouts: %d" % (
-            len(self.active), self.engine.n_in, self.engine.src_rate, self.engine.underruns()))
+        playing = len(self.engine.outs) - len(self.engine.stalled())
+        waiting = [n for n in self.checked if n not in [o.name for o in self.engine.outs]]
+        self.status.setText("Running · %d speaker(s) playing%s · source %d ch @ %d Hz · dropouts: %d" % (
+            playing, " · %d waiting to reconnect" % len(waiting) if waiting else "",
+            self.engine.n_in, self.engine.src_rate, self.engine.underruns()))

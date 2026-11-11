@@ -22,7 +22,7 @@ class RoomView(QWidget):
         self.sel = LISTENER
         self._drag = None
         self._last = None
-        self.setMinimumSize(420, 300)
+        self.setMinimumSize(280, 200)
         self.setMouseTracking(True)
 
     # ---- camera ------------------------------------------------------

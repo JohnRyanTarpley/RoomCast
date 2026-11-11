@@ -2,9 +2,10 @@
 //
 // It does not reimplement any setup logic; the batch file remains the single
 // source of truth. The exe only decides whether the batch window is shown:
-//   - First run (no .venv yet): the window is shown so the user can watch the
-//     package install and read any error message / "pause" prompt.
-//   - Later runs: the window is hidden, so the app opens with no console flash.
+//   - When packages are about to be installed (first run, or requirements.txt
+//     changed): the window is shown so the user can watch the install and read
+//     any error message / "pause" prompt.
+//   - Otherwise: the window is hidden, so the app opens with no console flash.
 //
 // Build with launcher\build.bat (uses the C# compiler included with Windows).
 
@@ -30,13 +31,13 @@ static class Program
             return 1;
         }
 
-        bool firstRun = !File.Exists(Path.Combine(root, @".venv\Scripts\python.exe"));
+        bool installing = NeedsInstall(root);
 
         var psi = new ProcessStartInfo(bat)
         {
             WorkingDirectory = root,
             UseShellExecute = true,
-            WindowStyle = firstRun ? ProcessWindowStyle.Normal : ProcessWindowStyle.Hidden,
+            WindowStyle = installing ? ProcessWindowStyle.Normal : ProcessWindowStyle.Hidden,
         };
 
         try
@@ -50,5 +51,23 @@ static class Program
             return 1;
         }
         return 0;
+    }
+
+    // Mirrors the batch file's check: packages are (re)installed on first run and
+    // whenever requirements.txt differs from the copy saved after the last install.
+    static bool NeedsInstall(string root)
+    {
+        try
+        {
+            if (!File.Exists(Path.Combine(root, @".venv\Scripts\python.exe"))) return true;
+            string installed = Path.Combine(root, @".venv\requirements.installed");
+            if (!File.Exists(installed)) return true;
+            byte[] a = File.ReadAllBytes(Path.Combine(root, "requirements.txt"));
+            byte[] b = File.ReadAllBytes(installed);
+            if (a.Length != b.Length) return true;
+            for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return true;
+            return false;
+        }
+        catch (IOException) { return true; }
     }
 }

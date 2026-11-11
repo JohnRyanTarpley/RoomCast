@@ -25,10 +25,12 @@ Windows). Put a `RoomCast.ico` in `launcher/` before building to give it an icon
 
 ## Using it
 
-1. **Connect the speakers in Windows.** Pair and connect every speaker in
-   Settings > Bluetooth (the app has a button that opens it). Windows, not
-   RoomCast, owns the Bluetooth link; each connected speaker then appears in
-   RoomCast as an output. Press **Refresh** and tick the ones to use.
+1. **Connect the speakers.** Press **Add a Bluetooth speaker…**, put the
+   speaker in pairing mode and pair it from inside RoomCast (or use Windows
+   Settings > Bluetooth). Tick the speakers to use. Each one shows its
+   connection state and, if the speaker reports it, its battery level.
+   Paired speakers that are switched off stay in the list with a
+   **Reconnect** button.
 2. **Pick the audio source.** RoomCast records what Windows sends to one
    output device and redistributes it. That device must *not* be one of the
    ticked speakers. Two good choices:
@@ -44,6 +46,21 @@ Windows). Put a `RoomCast.ico` in `launcher/` before building to give it an icon
 
 True 5.1/7.1 input is used when the source device is configured for it in
 Windows; stereo sources are upmixed (optional).
+
+**Connection problems are handled for you:**
+
+- If a speaker drops out while playing, the others keep going (in Surround
+  mode they take over its channels). The speaker rejoins automatically when
+  Windows sees it again, with its delay and position kept.
+- While playing, RoomCast asks Windows to reconnect ticked speakers that have
+  disconnected, every 30 seconds (can be switched off).
+- Speakers with a microphone show up in Windows twice; RoomCast hides the
+  low-quality "Hands-Free" (phone call) output and warns when a speaker is
+  stuck in that mode.
+
+Many built-in Bluetooth adapters struggle with more than 2–3 speakers playing
+at once, and Windows uses only one adapter at a time. A good USB Bluetooth
+5.x adapter helps if speakers keep dropping out.
 
 Expect roughly a quarter to half a second between the PC and the speakers.
 That is fine for music, but video will be out of lip-sync unless the player
@@ -71,6 +88,8 @@ has an audio-offset setting.
 | `engine.py` | Real-time routing. `Engine` turns each captured block into one signal per speaker; `SpeakerOut` holds it in a ring buffer and feeds that speaker's device callback. |
 | `dsp.py` | Channel layouts, stereo upmix, direction-based panning, downmix, Butterworth band filters. |
 | `backend.py` | WASAPI device listing, loopback capture and output streams (PyAudioWPatch). |
+| `bluetooth.py` | Windows device APIs: endpoint state incl. disconnected paired speakers and hands-free detection (Core Audio via ctypes), one-shot Bluetooth reconnect (`IKsControl`), battery level (`cfgmgr32`), scanning and pairing (WinRT via `winrt-*`). No drivers or admin rights. |
+| `connection.py` | `DeviceMonitor` (background polling: state every 2 s, battery every 30 s; runs reconnects off the GUI thread) and the pairing dialog. |
 
 Key design points:
 
@@ -89,3 +108,10 @@ Key design points:
 - **Thread model.** The capture callback does the mixing and writes to the
   ring buffers; each device has its own output callback; the GUI thread only
   swaps settings (`Engine.apply`) and reads meters.
+- **Dropout recovery.** A speaker whose device stops asking for audio for 1 s
+  is closed on its own (`Engine.stalled` / `Engine.drop`). The window then
+  restarts playback without it, re-scanning devices, and again when Windows
+  reports it connected. A speaker that keeps failing is left out for longer
+  each time (10 s up to 2 min).
+- **Packages.** `Run RoomCast.bat` reinstalls packages whenever
+  `requirements.txt` changes (it keeps a copy in `.venv\requirements.installed`).
