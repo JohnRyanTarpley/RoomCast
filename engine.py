@@ -35,6 +35,35 @@ class MixSettings:
     speakers: list = field(default_factory=list)
 
 
+def beep_tone(rate, seconds=0.5, freq=660.0):
+    t = np.arange(int(rate * seconds)) / rate
+    env = np.minimum(1, np.minimum(t, seconds - t) / 0.02)
+    return (0.35 * np.sin(2 * np.pi * freq * t) * env).astype(np.float32)
+
+
+TONE_LEAD_S = 0.35      # Bluetooth speakers often swallow the first moment after waking
+
+
+def open_tone_stream(backend, dev):
+    """Open the device on its own and play the identify tone once (used while
+    playback is stopped). The caller closes the stream after TONE_TOTAL_S."""
+    rate = int(dev["rate"])
+    tone = np.concatenate([np.zeros(int(rate * TONE_LEAD_S), np.float32), beep_tone(rate)])
+    pos = [0]
+
+    def pull(n):
+        out = np.zeros((n, 2), np.float32)
+        k = max(0, min(n, len(tone) - pos[0]))
+        out[:k] = tone[pos[0]:pos[0] + k, None]
+        pos[0] += k
+        return out
+
+    return backend.open_output(dev["index"], rate, int(dev["channels"]), pull)
+
+
+TONE_TOTAL_S = TONE_LEAD_S + 0.5 + 0.4
+
+
 class SpeakerOut:
     """Delay line + drift-correcting resampler feeding one output device."""
 
@@ -282,12 +311,14 @@ class Engine:
             time.sleep(max(0.0, t0 + n / rate - time.perf_counter()))
 
     # ---- utilities ---------------------------------------------------
-    def beep(self, i):
-        if 0 <= i < len(self.outs):
-            rate = self._dev_rates[i]
-            t = np.arange(int(rate * 0.5)) / rate
-            env = np.minimum(1, np.minimum(t, 0.5 - t) / 0.02)
-            self.outs[i].beep = (0.35 * np.sin(2 * np.pi * 660 * t) * env).astype(np.float32)
+    def beep(self, name):
+        """Play the identify tone on the speaker with this name. Returns False if
+        that speaker isn't playing right now (not part of playback, or dropped out)."""
+        for o, s, rate in zip(self.outs, self._out_streams, self._dev_rates):
+            if o.name == name and s is not None:
+                o.beep = beep_tone(rate)
+                return True
+        return False
 
     def levels(self):
         lv = []

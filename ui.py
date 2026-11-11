@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComb
 
 import dsp
 from connection import DeviceMonitor, PairDialog, bt
-from engine import Engine, MixSettings, SpeakerSettings
+from engine import TONE_TOTAL_S, Engine, MixSettings, SpeakerSettings, open_tone_stream
 from room_view import LISTENER, RoomView
 
 COLORS = ["#ff6b6b", "#4dabf7", "#51cf66", "#fcc419", "#cc5de8", "#ff922b", "#22b8cf", "#f783ac"]
@@ -285,6 +285,8 @@ class MainWindow(QMainWindow):
         self.reconnecting = {}       # speaker name -> time a manual Reconnect was pressed
         self.reconnect_failed = {}   # speaker name -> time it failed
         self.last_auto = {}          # speaker name -> time of last automatic reconnect attempt
+        self._tone_streams = []      # identify tones playing while stopped
+        self._notice = ("", 0.0)     # short message kept in the status line until a time
 
         self.backend, self.backend_error = backend, ""
         if backend is None:
@@ -333,6 +335,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         self.monitor.stop()
+        self._close_tones()
         self.engine.stop()
         self._save_layout()
         self._save()
@@ -688,6 +691,7 @@ class MainWindow(QMainWindow):
     def refresh_devices(self):
         """Re-scan devices. If playback is on, it continues with the new list."""
         resume = self.start_btn.isChecked()
+        self._close_tones()             # the device re-scan below needs every stream closed
         self.engine.stop()
         self._sync_endpoints()
         self.outputs, self.sources = [], []
@@ -789,8 +793,8 @@ class MainWindow(QMainWindow):
             mute.toggled.connect(lambda on, s=s: self._set(s, "mute", on))
             self.table.setCellWidget(r, 3, mute)
             b = QPushButton("Beep")
-            b.setToolTip("Plays a short tone on this speaker only (while running).")
-            b.clicked.connect(lambda _, r=r: self.engine.beep(r))
+            b.setToolTip("Plays a short tone on this speaker only, to check which one it is.")
+            b.clicked.connect(lambda _, name=s.name: self._beep(name))
             self.table.setCellWidget(r, 4, b)
             m = QProgressBar()
             m.setRange(0, 100)
@@ -1088,6 +1092,43 @@ class MainWindow(QMainWindow):
         if ok:
             self.monitor.poll_now()
 
+    def _beep(self, name):
+        """Identify tone. While playing it is mixed into that speaker's audio;
+        while stopped the speaker is opened on its own just for the tone."""
+        if self.engine.running:
+            if not self.engine.beep(name):
+                self._flash("%s isn't playing right now (it may have dropped out), "
+                            "so it can't beep." % name)
+            return
+        dev = next((d for d in self.outputs if d["name"] == name), None)
+        if dev is None or self.backend is None:
+            self._flash("%s isn't connected, so it can't beep." % name)
+            return
+        try:
+            stream = open_tone_stream(self.backend, dev)
+        except Exception as e:
+            self._flash("Couldn't play a tone on %s: %s" % (name, e))
+            return
+        self._tone_streams.append(stream)
+        QTimer.singleShot(int(TONE_TOTAL_S * 1000), lambda: self._close_tone(stream))
+
+    def _flash(self, text, seconds=6.0):
+        """Show a message in the status line for a few seconds, even while playing."""
+        self._notice = (text, time.monotonic() + seconds)
+        self.status.setText(text)
+
+    def _close_tone(self, stream):
+        if stream in self._tone_streams:
+            self._tone_streams.remove(stream)
+            try:
+                self.backend.close(stream)
+            except Exception:
+                pass
+
+    def _close_tones(self):
+        for s in list(self._tone_streams):
+            self._close_tone(s)
+
     def _add_speaker(self):
         dlg = PairDialog(self)
         dlg.paired.connect(self.monitor.poll_now)
@@ -1135,6 +1176,8 @@ class MainWindow(QMainWindow):
         for m, lv in zip(self.meters, self.engine.levels()):
             db = 20 * np.log10(max(lv, 1e-4))
             m.setValue(int(np.clip((db + 60) / 60 * 100, 0, 100)))
+        if time.monotonic() < self._notice[1]:
+            return self.status.setText(self._notice[0])
         playing = len(self.engine.outs) - len(self.engine.stalled())
         waiting = [n for n in self.checked if n not in [o.name for o in self.engine.outs]]
         self.status.setText("Running · %d speaker(s) playing%s · source %d ch @ %d Hz · dropouts: %d" % (
