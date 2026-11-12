@@ -220,10 +220,17 @@ class SpeakerRow(QWidget):
         self.btn.setEnabled(reconnect_enabled)
         self.dis_btn.setVisible(disconnect and not reconnect)
 
-    def set_battery(self, pct):
+    def set_battery(self, pct, unknown=False):
+        """Show the battery percentage. With pct None, `unknown` marks a
+        connected Bluetooth speaker that doesn't report its battery."""
         if pct is None:
-            self.battery.clear()
-            self.battery.setToolTip("")
+            if unknown:
+                self.battery.setText("🔋 <span style='color:%s'>–</span>" % GREY)
+                self.battery.setToolTip("RoomCast can't get this speaker's battery level: "
+                                        "it doesn't report it to Windows.")
+            else:
+                self.battery.clear()
+                self.battery.setToolTip("")
             return
         color = RED if pct <= 20 else (AMBER if pct <= 40 else None)
         text = "🔋 %d%%" % pct
@@ -1317,7 +1324,9 @@ class MainWindow(QMainWindow):
             can_disconnect = bool(e and e["bluetooth"] and e["connected"] and not e["hands_free"]
                                   and name not in self.disconnecting)
             row.set_state(text, color, show, enabled, can_disconnect)
-            row.set_battery(self.battery.get(e["container"]) if e and e["bluetooth"] else None)
+            is_bt = bool(e and e["bluetooth"])
+            row.set_battery(self.battery.get(e["container"]) if is_bt else None,
+                            unknown=is_bt and e["connected"] and not e["hands_free"])
         self._fit_rows()
 
     def _tick(self):
