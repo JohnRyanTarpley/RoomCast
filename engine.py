@@ -85,6 +85,7 @@ class SpeakerOut:
         self.frac = 0.0       # read position, fractional part
         self.t_w = 0.0
         self.primed = False
+        self.t_primed = 0.0   # when it last started playing real audio
         self.err = 0.0
         self.target_s = 0.1
         self.resync = False   # set when the delay is changed: jump to it straight away
@@ -96,6 +97,13 @@ class SpeakerOut:
         self.beep = None
         self.t_pull = time.perf_counter()   # last time the device asked for audio
         self.lock = threading.Lock()
+
+    def reset(self):
+        """Forget the playback position; the next reads line up with the
+        others again (used when the speaker rejoins)."""
+        with self.lock:
+            self.primed = False
+            self.r, self.frac, self.err = self.w, 0.0, 0.0
 
     def write(self, x):
         n = len(x)
@@ -124,6 +132,7 @@ class SpeakerOut:
                     return silence
                 self.r, self.frac, self.err = int(w_est - target), 0.0, 0.0
                 self.primed, self.resync, self.t_ok = True, False, now
+                self.t_primed = now
                 fill = target
             err = fill - target
             if abs(err) <= self.JUMP_S * rate:
@@ -172,6 +181,12 @@ class Engine:
     # pauses happen when the speaker's radio is busy with another connected
     # device; the speaker catches up by itself, so don't restart everyone for it.
     STALL_S = 4.0
+    # A rejoining speaker gets its surround channels back only once it has been
+    # taking audio steadily for this long (Bluetooth speakers are often silent
+    # for a moment after waking up) ...
+    WARM_S = 0.5
+    # ... and surround channels always move between speakers with a fade this long.
+    FADE_S = 0.5
 
     def __init__(self, backend):
         self.backend = backend
@@ -182,8 +197,17 @@ class Engine:
         self._out_streams = []
         self._capture = None
         self._filters = []
+        self._devs = []
+        self._settings = None
         self.src_rate = 48000
         self.n_in = 2
+        # Speakers being reopened in the background (see rejoin()).
+        self._lock = threading.Lock()
+        self._gen = 0                 # bumped by stop(): late reopens are discarded
+        self._pending = {}            # speaker index -> thread
+        self._rejoined = []           # (speaker index, stream or None)
+        self._warming = set()         # rejoined speakers not yet given their surround channels
+        self._fade = None             # [matrix faded from, matrix faded to, progress 0..1]
 
     # ---- lifecycle ---------------------------------------------------
     def start(self, source: dict, outputs: list, settings: MixSettings):
@@ -195,6 +219,7 @@ class Engine:
         self.n_in = int(source["channels"])
         self.outs = [SpeakerOut(o["name"], self.src_rate, int(o["rate"])) for o in outputs]
         self._dev_rates = [int(o["rate"]) for o in outputs]
+        self._devs = list(outputs)
         self._filters = [None] * len(self.outs)
         self.apply(settings)
         self.running = True
@@ -210,6 +235,8 @@ class Engine:
         if outputs and len(failed) == len(outputs):
             self.stop()
             raise first_error
+        if failed:
+            self.apply(settings)        # pan surround over the speakers that did open
         try:
             self._capture = self.backend.open_capture(
                 source["index"], self.src_rate, self.n_in, self._on_capture)
@@ -224,12 +251,20 @@ class Engine:
 
     def stop(self):
         self.running = False
-        for s in self._out_streams + [self._capture]:
+        with self._lock:
+            self._gen += 1
+            late, self._rejoined = [s for _, s in self._rejoined], []
+        for t in self._pending.values():    # the device re-scan after a stop needs them finished
+            t.join(timeout=5.0)
+        self._pending = {}
+        self._warming = set()
+        for s in self._out_streams + [self._capture] + late:
             self._close(s)
         self._out_streams = []
         self._capture = None
         self.outs = []
         self.plan = None
+        self._fade = None
 
     def _close(self, stream):
         if stream is not None:
@@ -247,23 +282,89 @@ class Engine:
                 if s is not None and now - o.t_pull > self.STALL_S]
 
     def drop(self, i):
-        """Close one speaker's stream; the other speakers keep playing."""
-        if 0 <= i < len(self._out_streams):
+        """Close one speaker's stream; the other speakers keep playing (in
+        surround, its channels are re-panned onto them)."""
+        if 0 <= i < len(self._out_streams) and self._out_streams[i] is not None:
             s, self._out_streams[i] = self._out_streams[i], None
+            self._warming.discard(i)
             self._close(s)
+            self._reapply()
+
+    def index_of(self, name):
+        return next((i for i, o in enumerate(self.outs) if o.name == name), None)
+
+    def is_open(self, i):
+        return 0 <= i < len(self._out_streams) and self._out_streams[i] is not None
+
+    def rejoin(self, i):
+        """Reopen a dropped speaker in the background while the others keep
+        playing. It comes back time-aligned with them. The result arrives
+        through poll_rejoined(). Returns False if there is nothing to do."""
+        if i in self._pending:
+            return True                 # already on its way back
+        if not self.running or self.is_open(i) or not 0 <= i < len(self.outs):
+            return False
+        o, dev, gen = self.outs[i], self._devs[i], self._gen
+        o.reset()
+
+        def run():
+            try:
+                s = self.backend.open_output(dev["index"], int(dev["rate"]), int(dev["channels"]), o.pull)
+            except Exception:
+                s = None
+            with self._lock:
+                if gen == self._gen:
+                    self._rejoined.append((i, s))
+                    return
+            self._close(s)              # playback was stopped meanwhile
+
+        t = threading.Thread(target=run, name="rejoin", daemon=True)
+        self._pending[i] = t
+        t.start()
+        return True
+
+    def poll_rejoined(self):
+        """Put speakers reopened by rejoin() back into playback, and give
+        warmed-up ones their surround channels back. Returns [(index, ok)].
+        Call regularly, from the same thread that calls apply()."""
+        with self._lock:
+            done, self._rejoined = self._rejoined, []
+        for i, s in done:
+            self._pending.pop(i, None)
+            if s is not None:
+                self.outs[i].t_pull = time.perf_counter() + 2.0   # let it start up
+                self._out_streams[i] = s
+                self._warming.add(i)
+        now = time.perf_counter()
+        warm = {i for i in self._warming
+                if self.outs[i].primed and now - self.outs[i].t_primed >= self.WARM_S}
+        if warm:
+            self._warming -= warm
+            self._reapply()
+        return [(i, s is not None) for i, s in done]
+
+    def _reapply(self):
+        if self._settings is not None:
+            self.apply(self._settings)
 
     # ---- configuration (safe to call while running) -------------------
     def apply(self, st: MixSettings):
         n = len(self.outs)
         if n == 0 or len(st.speakers) != n:
             return
+        self._settings = st
         trims = np.array([s.trim_ms / 1000.0 for s in st.speakers])
         comp = np.zeros(n)
         M = None
         if st.mode == "surround":
             pos = [s.pos for s in st.speakers]
             az, U = dsp.bed(self.n_in, st.upmix)
-            G = dsp.pan_gains(pos, st.listener, az, st.focus)
+            # Pan only onto speakers that are playing, so a dropped speaker's
+            # channels aren't lost. Delay and level compensation still use every
+            # speaker, so the others' timing doesn't move when one drops out.
+            live = [i for i in range(n) if self.is_open(i) and i not in self._warming] or list(range(n))
+            G = np.zeros((n, len(az)), np.float32)
+            G[live] = dsp.pan_gains([pos[i] for i in live], st.listener, az, st.focus)
             dist = dsp.distances(pos, st.listener)
             if st.level_comp:
                 G = G * np.clip(dist / dist.max(), 0.1, 1.0)[:, None]
@@ -299,14 +400,33 @@ class Engine:
             return
         mode, M, D = plan
         if mode == "surround":
-            mono = block @ M.T
+            mono = self._faded_mix(block, M)
             for i, o in enumerate(outs):
                 o.write(np.repeat(mono[:, i:i + 1], 2, axis=1))
         else:
+            self._fade = None           # entering surround later starts without a fade
             stereo = block @ D.T
             for i, o in enumerate(outs):
                 f = self._filters[i] if mode == "frequency" else None
                 o.write(f.process(stereo) if f is not None else stereo)
+
+    def _faded_mix(self, block, M):
+        """block @ M.T, but when M changes (a speaker dropped out or came back,
+        or the layout changed) glide from the old matrix to the new one over
+        FADE_S instead of switching at once."""
+        f = self._fade
+        if f is None or f[0].shape != M.shape:
+            f = self._fade = [M, M, 1.0]
+        elif f[1] is not M:             # new target: start from wherever the last fade got to
+            cur = f[0] + (f[1] - f[0]) * np.float32(f[2])
+            f = self._fade = [cur, M, 0.0]
+        if f[2] >= 1.0:
+            return block @ M.T
+        n = len(block)
+        p1 = min(1.0, f[2] + n / (self.FADE_S * self.src_rate))
+        a = np.linspace(f[2], p1, n, endpoint=False, dtype=np.float32)[:, None]
+        f[2] = p1
+        return (block @ f[0].T) * (1.0 - a) + (block @ M.T) * a
 
     def _click_loop(self):
         rate = self.src_rate

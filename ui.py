@@ -280,8 +280,10 @@ class MainWindow(QMainWindow):
         self.endpoints = {}          # endpoint name -> info from bluetooth.list_endpoints()
         self.battery = {}            # container id -> battery %
         self.rows = {}               # speaker name -> SpeakerRow
-        self.dropped = {}            # speaker name -> {"t", "gone", "hold"}: left out until it returns
+        self.dropped = {}            # speaker name -> {"t", "gone", "hold", "rejoining"}: left out until it returns
         self.drop_history = {}       # speaker name -> recent drop times (for back-off)
+        self.rejoin_fails = {}       # speaker name -> failed in-place rejoins in a row
+        self.last_rescan = {}        # speaker name -> last full restart made to bring it back
         self.reconnecting = {}       # speaker name -> time a manual Reconnect was pressed
         self.reconnect_failed = {}   # speaker name -> time it failed
         self.last_auto = {}          # speaker name -> time of last automatic reconnect attempt
@@ -978,10 +980,9 @@ class MainWindow(QMainWindow):
                               "every ticked speaker is still connected." % e)
         self.engine.click_on = self.click.isChecked()
         self._set_running_ui()
-        if failed:                      # play on the others; leave these out until they recover
+        if failed:                      # play on the others; these rejoin by themselves later
             for k in failed:
                 self._mark_dropped(self.active[k].name)
-            self._schedule_restart(1500)
         self._update_rows()
         self._save()
 
@@ -989,6 +990,7 @@ class MainWindow(QMainWindow):
         self._restart_timer.stop()
         self.engine.stop()
         self.dropped.clear()
+        self.rejoin_fails.clear()
         self.start_btn.setChecked(False)
         self.start_btn.setText("Start")
         self.status.setText("Stopped")
@@ -1017,22 +1019,76 @@ class MainWindow(QMainWindow):
         self.drop_history[name] = hist
         self.dropped[name] = {"t": now, "gone": False, "hold": min(10 * 2 ** (len(hist) - 1), 120)}
 
+    def _drop_now(self, name, gone=False):
+        """Take one speaker out of playback; the others keep playing."""
+        i = self.engine.index_of(name)
+        if i is not None:
+            self.engine.drop(i)                 # surround re-pans onto the others by itself
+        self._mark_dropped(name)
+        self.dropped[name]["gone"] = gone
+
+    def _schedule_rejoin(self, name, ms):
+        d = self.dropped.setdefault(name, {"t": time.monotonic(), "gone": False, "hold": 10})
+        d["gone"], d["rejoining"] = False, True
+        QTimer.singleShot(ms, lambda: self._try_rejoin(name))
+
+    def _try_rejoin(self, name):
+        """Put a returning speaker back into playback without interrupting the
+        others. Falls back to restarting playback when that isn't possible
+        (e.g. it wasn't part of this playback session)."""
+        if not self.start_btn.isChecked():
+            self.dropped.pop(name, None)
+            return
+        e = self.endpoints.get(name)
+        if e is not None and not e["connected"]:    # still off: wait until Windows sees it again
+            d = self.dropped.setdefault(name, {"t": time.monotonic(), "hold": 10})
+            d["gone"], d["rejoining"] = True, False
+            self._update_rows()
+            return
+        i = self.engine.index_of(name) if self.engine.running else None
+        if i is not None:
+            self.engine.drop(i)                 # a stream left over from before it disconnected
+            if self.engine.rejoin(i):
+                self.dropped.setdefault(name, {"t": time.monotonic(), "gone": False, "hold": 10})
+                self.dropped[name]["rejoining"] = True
+                self._update_rows()
+                return
+        self.dropped.pop(name, None)
+        self._schedule_restart(500)
+
     def _check_dropouts(self):
         now = time.monotonic()
         if self.engine.running:
             stalled = self.engine.stalled()
             for i in stalled:
+                self._drop_now(self.engine.outs[i].name)
+            changed = bool(stalled)
+            for i, ok in self.engine.poll_rejoined():
+                changed = True
                 name = self.engine.outs[i].name
-                self.engine.drop(i)
-                self._mark_dropped(name)
-            if stalled:
-                self._schedule_restart(1500)    # re-plan without them (surround re-pans)
+                if ok:
+                    self.dropped.pop(name, None)
+                    self.rejoin_fails.pop(name, None)
+                    continue
+                fails = self.rejoin_fails[name] = self.rejoin_fails.get(name, 0) + 1
+                gone = self.dropped.get(name, {}).get("gone", False)
+                if fails == 1:                  # try again shortly
+                    self.dropped[name] = {"t": now, "gone": gone, "hold": 3}
+                elif now - self.last_rescan.get(name, -1e9) > 300:
+                    # Its device entry may be out of date. Re-scanning needs a short
+                    # restart of every speaker, so allow it only now and then.
+                    self.last_rescan[name] = now
+                    del self.rejoin_fails[name]
+                    self.dropped.pop(name, None)
+                    self._schedule_restart(500)
+                else:                           # keep trying now and then, without a restart
+                    self._mark_dropped(name)
+                    self.dropped[name]["gone"] = gone
+            if changed:
                 self._update_rows()
         for name, d in list(self.dropped.items()):
-            if not d["gone"] and now - d["t"] > d["hold"]:
-                del self.dropped[name]          # never actually disconnected: try it again
-                if self.start_btn.isChecked():
-                    self._schedule_restart(500)
+            if not d["gone"] and not d.get("rejoining") and now - d["t"] > d["hold"]:
+                self._try_rejoin(name)          # never actually disconnected: try it again
 
     def _on_monitor(self, endpoints, battery):
         old = self.endpoints
@@ -1045,7 +1101,7 @@ class MainWindow(QMainWindow):
         def up(d):
             return {n for n, e in d.items() if e["connected"] and not e["hands_free"]}
 
-        returned = False
+        returned = set()
         for name, d in list(self.dropped.items()):
             e = self.endpoints.get(name)
             if e is None:
@@ -1053,8 +1109,7 @@ class MainWindow(QMainWindow):
             if not e["connected"]:
                 d["gone"] = True
             elif d["gone"]:
-                del self.dropped[name]          # back again
-                returned = True
+                returned.add(name)              # back again
         for name, t in list(self.reconnecting.items()):
             e = self.endpoints.get(name)
             if e is not None and e["connected"]:
@@ -1063,18 +1118,24 @@ class MainWindow(QMainWindow):
                 del self.reconnecting[name]
                 self.reconnect_failed[name] = now
 
-        if shape(old) != shape(self.endpoints):
-            if self.start_btn.isChecked():
-                # Only a change to a speaker that is playing needs a restart. Anything
-                # else (another speaker appearing, a hands-free endpoint coming and
-                # going because a phone connected to a speaker) must not interrupt
-                # the speakers that are playing.
-                if returned or (up(old) ^ up(self.endpoints)) & set(self.checked):
-                    self._schedule_restart(2000)    # let a fresh Bluetooth link settle first
-                else:
-                    self._add_new_rows()            # ticking one restarts playback to open it
-            else:
-                self.refresh_devices()
+        if self.start_btn.isChecked():
+            # Speakers leaving or returning are handled one at a time so the
+            # others keep playing. Anything else (another speaker appearing, a
+            # hands-free endpoint coming and going because a phone connected to
+            # a speaker) doesn't touch playback at all.
+            checked = set(self.checked)
+            came_up = ((up(self.endpoints) - up(old)) & checked) | returned
+            for name in (up(old) - up(self.endpoints)) & checked:
+                self._drop_now(name, gone=True)
+            for name in came_up:
+                i = self.engine.index_of(name)
+                if name not in returned and i is not None and self.engine.is_open(i):
+                    continue                        # already playing (e.g. first poll after launch)
+                self._schedule_rejoin(name, 2000)   # let a fresh Bluetooth link settle first
+            if shape(old) != shape(self.endpoints):
+                self._add_new_rows()                # ticking one restarts playback to open it
+        elif shape(old) != shape(self.endpoints):
+            self.refresh_devices()
 
         if self.start_btn.isChecked() and self.opts["auto_reconnect"]:
             for name in self.checked:
@@ -1162,6 +1223,8 @@ class MainWindow(QMainWindow):
                 return "Disconnected. RoomCast keeps trying to reconnect it.", RED, True, True
             return "Disconnected (paired). Switch it on or press Reconnect.", GREY, True, True
         if name in self.dropped:
+            if self.dropped[name].get("rejoining"):
+                return "Back. Rejoining playback…", AMBER, False, True
             return "Dropped out. It rejoins automatically when it's back.", AMBER, is_bt, True
         if self.engine.running and any(o.name == name for o in self.engine.outs):
             return "Playing", GREEN, False, True
