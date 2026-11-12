@@ -705,14 +705,7 @@ class MainWindow(QMainWindow):
         self._loading = True
         self.dev_list.clear()
         self.rows = {}
-        for name in self._list_names():
-            row = SpeakerRow(name, name in self.checked, self._on_toggle, self._reconnect)
-            it = QListWidgetItem()
-            it.setFlags(Qt.ItemIsEnabled)
-            it.setSizeHint(row.sizeHint())
-            self.dev_list.addItem(it)
-            self.dev_list.setItemWidget(it, row)
-            self.rows[name] = row
+        self._add_new_rows()
         self.src_combo.clear()
         for s in self.sources:
             self.src_combo.addItem("%s  (%d ch, %d Hz)" % (s["name"].replace(" [Loopback]", ""),
@@ -729,6 +722,19 @@ class MainWindow(QMainWindow):
         if resume:
             self._start(quiet=True)
         self._update_rows()
+
+    def _add_new_rows(self):
+        """Add a row for every listable speaker that doesn't have one yet."""
+        for name in self._list_names():
+            if name in self.rows:
+                continue
+            row = SpeakerRow(name, name in self.checked, self._on_toggle, self._reconnect)
+            it = QListWidgetItem()
+            it.setFlags(Qt.ItemIsEnabled)
+            it.setSizeHint(row.sizeHint())
+            self.dev_list.addItem(it)
+            self.dev_list.setItemWidget(it, row)
+            self.rows[name] = row
 
     def _on_source(self, i):
         if not self._loading and 0 <= i < len(self.sources):
@@ -1059,10 +1065,14 @@ class MainWindow(QMainWindow):
 
         if shape(old) != shape(self.endpoints):
             if self.start_btn.isChecked():
+                # Only a change to a speaker that is playing needs a restart. Anything
+                # else (another speaker appearing, a hands-free endpoint coming and
+                # going because a phone connected to a speaker) must not interrupt
+                # the speakers that are playing.
                 if returned or (up(old) ^ up(self.endpoints)) & set(self.checked):
                     self._schedule_restart(2000)    # let a fresh Bluetooth link settle first
-                elif set(self.endpoints) - set(old):
-                    self._schedule_restart(2000)    # new speaker: show it in the list
+                else:
+                    self._add_new_rows()            # ticking one restarts playback to open it
             else:
                 self.refresh_devices()
 

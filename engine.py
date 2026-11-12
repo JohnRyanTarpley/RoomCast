@@ -68,6 +68,11 @@ class SpeakerOut:
     """Delay line + drift-correcting resampler feeding one output device."""
 
     CAP_S = 4.0
+    JUMP_S = 0.04       # further than this from the target delay ...
+    JUMP_HOLD_S = 0.5   # ... for this long: jump instead of resampling. Bluetooth links
+                        # shared with another device (a phone connected to the same
+                        # speaker) pause and then catch up in a burst, and that
+                        # sorts itself out if left alone.
 
     def __init__(self, name, src_rate, dev_rate):
         self.name = name
@@ -82,6 +87,8 @@ class SpeakerOut:
         self.primed = False
         self.err = 0.0
         self.target_s = 0.1
+        self.resync = False   # set when the delay is changed: jump to it straight away
+        self.t_ok = time.perf_counter()   # last time the delay was close to the target
         self.volume = 1.0
         self.mute = False
         self.peak = 0.0
@@ -105,8 +112,9 @@ class SpeakerOut:
         rate = self.src_rate
         silence = np.zeros((n_out, 2), np.float32)
         with self.lock:
+            now = time.perf_counter()
             # Smooth estimate of how much audio has "arrived" by now.
-            age = min(max(time.perf_counter() - self.t_w, 0.0), 0.03)
+            age = min(max(now - self.t_w, 0.0), 0.03)
             w_est = self.w + age * rate
             floor = (self.base_ratio * 1.01 * n_out + 3) * 1.5
             target = max(self.target_s * rate, floor)
@@ -115,12 +123,16 @@ class SpeakerOut:
                 if fill < target:
                     return silence
                 self.r, self.frac, self.err = int(w_est - target), 0.0, 0.0
-                self.primed = True
+                self.primed, self.resync, self.t_ok = True, False, now
                 fill = target
             err = fill - target
-            if abs(err) > 0.04 * rate:      # far off (e.g. delay changed): jump
+            if abs(err) <= self.JUMP_S * rate:
+                self.t_ok = now
+            elif (self.resync or now - self.t_ok > self.JUMP_HOLD_S
+                  or self.r < self.w - self.cap + floor):   # about to be overwritten
                 self.r = max(int(w_est - target), self.w - self.cap + int(floor), 0)
                 self.frac, self.err, err = 0.0, 0.0, 0.0
+                self.resync, self.t_ok = False, now
             self.err += 0.05 * (err - self.err)
             ratio = self.base_ratio * (1.0 + float(np.clip(0.5 * self.err / rate, -0.005, 0.005)))
             p = self.frac + ratio * np.arange(n_out)
@@ -156,7 +168,10 @@ class SpeakerOut:
 
 
 class Engine:
-    STALL_S = 1.0       # a speaker that asks for no audio for this long has dropped out
+    # A speaker that asks for no audio for this long has dropped out. Shorter
+    # pauses happen when the speaker's radio is busy with another connected
+    # device; the speaker catches up by itself, so don't restart everyone for it.
+    STALL_S = 4.0
 
     def __init__(self, backend):
         self.backend = backend
@@ -265,7 +280,10 @@ class Engine:
         total = comp + trims
         total -= total.min()
         for o, s, t in zip(self.outs, st.speakers, total):
-            o.target_s = min(st.base_ms / 1000.0 + float(t), SpeakerOut.CAP_S - 1.0)
+            target = min(st.base_ms / 1000.0 + float(t), SpeakerOut.CAP_S - 1.0)
+            if abs(target - o.target_s) > 0.001:
+                o.resync = True
+            o.target_s = target
             o.volume = st.master * s.volume
             o.mute = s.mute
         self.plan = (st.mode, M, dsp.downmix(self.n_in))
