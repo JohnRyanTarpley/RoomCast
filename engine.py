@@ -296,6 +296,10 @@ class Engine:
     def is_open(self, i):
         return 0 <= i < len(self._out_streams) and self._out_streams[i] is not None
 
+    def is_playing(self, i):
+        """True once a speaker is open, taking audio and past its warm-up."""
+        return self.is_open(i) and self.outs[i].primed and i not in self._warming
+
     def rejoin(self, i):
         """Reopen a dropped speaker in the background while the others keep
         playing. It comes back time-aligned with them. The result arrives

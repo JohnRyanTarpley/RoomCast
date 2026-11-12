@@ -63,8 +63,14 @@ Windows; stereo sources are upmixed (optional).
 
 - If a speaker drops out while playing, the others keep going without a
   break. In Surround mode its channels fade over to them, and fade back once
-  it is playing again. The speaker rejoins automatically, in time with the
-  others, when Windows sees it again, with its delay and position kept.
+  it is playing again. The speaker rejoins automatically when Windows sees it
+  again, with its delay and position kept.
+- A returning speaker can end up slightly late, because audio queued up in
+  its Bluetooth link while it was away. So once it is playing again, RoomCast
+  restarts every speaker for about two seconds, which lines them all up
+  (**Resync all speakers when one comes back**, at most every 30 s; can be
+  switched off). The **Resync** button next to Stop does the same by hand,
+  whenever the speakers sound out of step.
 - Short pauses on one speaker (common when a phone is also connected to it,
   even if the phone isn't playing anything) are ridden out without resyncing
   or restarting anything. For the most reliable playback, disconnect phones
@@ -79,9 +85,28 @@ Many built-in Bluetooth adapters struggle with more than 2–3 speakers playing
 at once, and Windows uses only one adapter at a time. A good USB Bluetooth
 5.x adapter helps if speakers keep dropping out.
 
-Expect roughly a quarter to half a second between the PC and the speakers.
-That is fine for music, but video will be out of lip-sync unless the player
-has an audio-offset setting.
+### Video and lip-sync
+
+Expect roughly a quarter to half a second between the PC and the speakers:
+the **Safety buffer** (120 ms by default, can be set as low as 0 ms if your
+speakers play without dropouts) plus each speaker's own Bluetooth lag, which
+RoomCast can't change. That is fine for music. For video it is not a
+Bluetooth limit as such: when you play to a single Bluetooth speaker, Windows
+tells the video player about the lag and the player holds the picture back.
+Here the player only sees the source device, so it doesn't know about the
+delay. Workarounds:
+
+- **VLC:** Tools > Track Synchronization, set the audio track
+  synchronization to a negative value (start at -0.350 s), or press **J** to
+  adjust while watching. To keep it, set **Audio desynchronization
+  compensation** (Tools > Preferences > All > Audio) to the same value in ms.
+- **mpv:** add `audio-delay=-0.35` to `mpv.conf`, or adjust with
+  **Ctrl + −** / **Ctrl + +**. With yt-dlp installed, mpv also plays YouTube
+  links directly (`mpv <link>`), with the offset applied.
+- **MPC-HC:** Options > Internal Filters > Audio Switcher > time shift.
+- **Browsers, streaming apps and games** have no such setting. Lower the
+  Safety buffer as far as your speakers allow, or play them straight to one
+  speaker instead. Games can't hold the picture back in any case.
 
 ## Architecture
 
@@ -140,6 +165,12 @@ Key design points:
   twice does the window restart playback to re-scan devices (at most once
   every 5 minutes per speaker); otherwise a speaker that keeps failing is
   retried less often each time (10 s up to 2 min).
+- **Resync.** RoomCast's ring buffer puts a rejoined speaker exactly back on
+  target, but it can't see audio queued inside the Bluetooth link, which can
+  leave that speaker late. `MainWindow._resync` closes every stream, waits
+  1.5 s for Windows to close the Bluetooth audio links, then re-scans and
+  starts again. It runs automatically once a rejoined speaker is playing
+  (`Engine.is_playing`), at most every 30 s, and from the Resync button.
 - **Unrelated device changes don't interrupt playback.** Endpoints that come
   and go without affecting playback (another speaker, a hands-free endpoint
   flickering because a phone connected to a speaker) just update the list.
