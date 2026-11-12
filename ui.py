@@ -179,9 +179,9 @@ def split(orientation, *widgets, sizes=None):
 
 class SpeakerRow(QWidget):
     """One speaker in the device list: tick box, battery, connection state and
-    a Reconnect button for Bluetooth speakers."""
+    a Reconnect or Disconnect button for Bluetooth speakers."""
 
-    def __init__(self, name, checked, on_toggle, on_reconnect):
+    def __init__(self, name, checked, on_toggle, on_reconnect, on_disconnect):
         super().__init__()
         self.name = name
         g = QGridLayout(self)
@@ -206,12 +206,19 @@ class SpeakerRow(QWidget):
         self.btn.clicked.connect(lambda: on_reconnect(name))
         self.btn.hide()
         g.addWidget(self.btn, 1, 1, Qt.AlignRight)
+        self.dis_btn = QPushButton("Disconnect")
+        self.dis_btn.setToolTip("Disconnect this speaker from the PC (it stays paired). "
+                                "RoomCast won't reconnect it until you press Reconnect.")
+        self.dis_btn.clicked.connect(lambda: on_disconnect(name))
+        self.dis_btn.hide()
+        g.addWidget(self.dis_btn, 1, 1, Qt.AlignRight)
         g.setColumnStretch(0, 1)
 
-    def set_state(self, text, color, reconnect=False, reconnect_enabled=True):
+    def set_state(self, text, color, reconnect=False, reconnect_enabled=True, disconnect=False):
         self.state.setText("<span style='color:%s'>●</span> %s" % (color, text))
         self.btn.setVisible(reconnect)
         self.btn.setEnabled(reconnect_enabled)
+        self.dis_btn.setVisible(disconnect and not reconnect)
 
     def set_battery(self, pct):
         if pct is None:
@@ -286,6 +293,8 @@ class MainWindow(QMainWindow):
         self.last_rescan = {}        # speaker name -> last full restart made to bring it back
         self.reconnecting = {}       # speaker name -> time a manual Reconnect was pressed
         self.reconnect_failed = {}   # speaker name -> time it failed
+        self.disconnecting = {}      # speaker name -> time Disconnect was pressed
+        self.user_disconnected = set()   # disconnected on purpose: don't auto-reconnect them
         self.last_auto = {}          # speaker name -> time of last automatic reconnect attempt
         self._tone_streams = []      # identify tones playing while stopped
         self._notice = ("", 0.0)     # short message kept in the status line until a time
@@ -310,6 +319,7 @@ class MainWindow(QMainWindow):
         self.monitor = DeviceMonitor()
         self.monitor.updated.connect(self._on_monitor)
         self.monitor.reconnect_done.connect(self._on_reconnect_done)
+        self.monitor.disconnect_done.connect(self._on_disconnect_done)
         self.monitor.start()
         if self.backend is None:
             self.status.setText("Audio system unavailable: " + self.backend_error)
@@ -730,7 +740,8 @@ class MainWindow(QMainWindow):
         for name in self._list_names():
             if name in self.rows:
                 continue
-            row = SpeakerRow(name, name in self.checked, self._on_toggle, self._reconnect)
+            row = SpeakerRow(name, name in self.checked, self._on_toggle, self._reconnect,
+                             self._disconnect)
             it = QListWidgetItem()
             it.setFlags(Qt.ItemIsEnabled)
             it.setSizeHint(row.sizeHint())
@@ -985,6 +996,39 @@ class MainWindow(QMainWindow):
                 self._mark_dropped(self.active[k].name)
         self._update_rows()
         self._save()
+        self._keep_source_default()
+
+    def _keep_source_default(self):
+        """When a Bluetooth speaker connects (especially right after pairing),
+        Windows makes it the default output. Apps then play straight to that
+        speaker and the source RoomCast records from goes silent: music stops
+        while the calibration click (made inside RoomCast) still works. If the
+        default is one of RoomCast's own speakers, point it back at the source."""
+        if bt is None or not self.engine.running:
+            return
+        i = self.src_combo.currentIndex()
+        if not 0 <= i < len(self.sources):
+            return
+        src_name = self.sources[i]["name"].replace(" [Loopback]", "")
+        try:
+            default = bt.default_output()
+        except OSError:
+            return
+        if (default is None or default["name"] == src_name
+                or default["name"] not in [s.name for s in self.active]):
+            return
+        src = self.endpoints.get(src_name)
+        if src is None or not src["connected"]:
+            return
+        try:
+            bt.set_default_output(src["id"])
+        except OSError:
+            self._flash("Windows is sending sound straight to %s, so RoomCast hears nothing. In Windows "
+                        "sound settings, set the output back to %s." % (default["name"], src_name), 15)
+            return
+        self._flash("Windows had switched its sound output to %s (it does that when a speaker "
+                    "connects). Switched it back to %s so your music plays through RoomCast."
+                    % (default["name"], src_name), 10)
 
     def _stop(self):
         self._restart_timer.stop()
@@ -1110,6 +1154,14 @@ class MainWindow(QMainWindow):
                 d["gone"] = True
             elif d["gone"]:
                 returned.add(name)              # back again
+        for name, t in list(self.disconnecting.items()):
+            e = self.endpoints.get(name)
+            if e is None or not e["connected"] or now - t > 15:
+                del self.disconnecting[name]
+        for name in list(self.user_disconnected):
+            e = self.endpoints.get(name)
+            if e is not None and e["connected"] and name not in self.disconnecting:
+                self.user_disconnected.discard(name)    # connected again some other way
         for name, t in list(self.reconnecting.items()):
             e = self.endpoints.get(name)
             if e is not None and e["connected"]:
@@ -1141,9 +1193,11 @@ class MainWindow(QMainWindow):
             for name in self.checked:
                 e = self.endpoints.get(name)
                 if (e and e["bluetooth"] and not e["connected"] and name not in self.reconnecting
+                        and name not in self.user_disconnected
                         and now - self.last_auto.get(name, -1e9) > 30):
                     self.last_auto[name] = now
                     self.monitor.request_reconnect(e["id"], name)
+        self._keep_source_default()
         self._update_rows()
 
     def _reconnect(self, name):
@@ -1152,8 +1206,28 @@ class MainWindow(QMainWindow):
             return
         self.reconnecting[name] = time.monotonic()
         self.reconnect_failed.pop(name, None)
+        self.user_disconnected.discard(name)
         self.monitor.request_reconnect(e["id"], name)
         self._update_rows()
+
+    def _disconnect(self, name):
+        """Disconnect a Bluetooth speaker from the PC (it stays paired). If it is
+        playing, the other speakers carry on without it."""
+        e = self.endpoints.get(name)
+        if e is None or not e["connected"]:
+            return
+        self.disconnecting[name] = time.monotonic()
+        self.user_disconnected.add(name)
+        self.monitor.request_disconnect(e["id"], name)
+        self._update_rows()
+
+    def _on_disconnect_done(self, name, ok, message):
+        if not ok:
+            self.disconnecting.pop(name, None)
+            self.user_disconnected.discard(name)
+            self._flash("Couldn't disconnect %s%s. You can disconnect it in Windows Bluetooth "
+                        "settings." % (name, ": " + message if message else ""), 10)
+            self._update_rows()
 
     def _on_reconnect_done(self, name, ok, message):
         if not ok and name in self.reconnecting:
@@ -1211,9 +1285,13 @@ class MainWindow(QMainWindow):
         e = self.endpoints.get(name)
         is_bt = bool(e and e["bluetooth"])
         now = time.monotonic()
+        if e is not None and e["connected"] and name in self.disconnecting:
+            return "Disconnecting…", AMBER, False, True
         if e is not None and not e["connected"]:
             if name in self.reconnecting:
                 return "Reconnecting…", AMBER, True, False
+            if name in self.user_disconnected:
+                return "Disconnected. Press Reconnect to use it again.", GREY, True, True
             if now - self.reconnect_failed.get(name, -1e9) < 30:
                 return "Couldn't reconnect. Is it switched on and nearby?", RED, True, True
             if self._hands_free_only(e):
@@ -1235,8 +1313,10 @@ class MainWindow(QMainWindow):
     def _update_rows(self):
         for name, row in self.rows.items():
             text, color, show, enabled = self._row_state(name)
-            row.set_state(text, color, show, enabled)
             e = self.endpoints.get(name)
+            can_disconnect = bool(e and e["bluetooth"] and e["connected"] and not e["hands_free"]
+                                  and name not in self.disconnecting)
+            row.set_state(text, color, show, enabled, can_disconnect)
             row.set_battery(self.battery.get(e["container"]) if e and e["bluetooth"] else None)
         self._fit_rows()
 

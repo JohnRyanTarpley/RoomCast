@@ -168,9 +168,50 @@ def list_endpoints():
     return res
 
 
-def _bt_request(endpoint_id, prop_id):
+E_MULTIMEDIA = 1
+# IPolicyConfig: not in the public SDK, but stable since Windows 7 and what
+# sound-switcher tools use to change the default playback device.
+CLSID_PolicyConfig = GUID("870AF99C-171D-4F9E-AF0D-E63DF40C2BC9")
+IID_IPolicyConfig = GUID("F8679F50-850A-41CF-9C72-430F290290C8")
+
+
+def default_output():
+    """Windows' current default playback device (same fields as
+    list_endpoints()), or None. Unlike the audio library's answer, this is
+    always up to date."""
     en = _enumerator()
-    dev, topo, conn, other, part, ks = (c_void_p() for _ in range(6))
+    dev = c_void_p()
+    try:
+        _vcall(en, 4, [ctypes.c_int, ctypes.c_int, POINTER(c_void_p)], E_RENDER, E_MULTIMEDIA, byref(dev))
+        return _device_info(dev)
+    except OSError:
+        return None
+    finally:
+        _release(dev)
+        _release(en)
+
+
+def set_default_output(endpoint_id):
+    """Make this playback device the Windows default (for apps and media).
+    Raises OSError if Windows refuses."""
+    p = c_void_p()
+    ctypes.oledll.ole32.CoCreateInstance(byref(CLSID_PolicyConfig), None, CLSCTX_ALL,
+                                         byref(IID_IPolicyConfig), byref(p))
+    try:
+        for role in (0, E_MULTIMEDIA):      # eConsole, eMultimedia (calls are left alone)
+            _vcall(p, 13, [ctypes.c_wchar_p, ctypes.c_int], endpoint_id, role)   # SetDefaultEndpoint
+    finally:
+        _release(p)
+
+
+def _bt_request(endpoint_id, prop_id):
+    """Send a one-shot request to the Bluetooth audio driver behind an endpoint.
+
+    The endpoint is connected to the driver's KS filter. IKsControl is not
+    available from that filter's IPart (E_NOINTERFACE), so look the filter up
+    as a device of its own and activate IKsControl on that instead."""
+    en = _enumerator()
+    dev, topo, conn, other, part, ftopo, fdev, ks = (c_void_p() for _ in range(8))
     try:
         _vcall(en, 5, [ctypes.c_wchar_p, POINTER(c_void_p)], endpoint_id, byref(dev))
         _vcall(dev, 3, [POINTER(GUID), wt.DWORD, c_void_p, POINTER(c_void_p)],
@@ -178,8 +219,15 @@ def _bt_request(endpoint_id, prop_id):
         _vcall(topo, 4, [ctypes.c_uint, POINTER(c_void_p)], 0, byref(conn))    # GetConnector(0)
         _vcall(conn, 8, [POINTER(c_void_p)], byref(other))                      # GetConnectedTo
         _vcall(other, 0, [POINTER(GUID), POINTER(c_void_p)], byref(IID_IPart), byref(part))
-        _vcall(part, 13, [wt.DWORD, POINTER(GUID), POINTER(c_void_p)],
-               CLSCTX_ALL, byref(IID_IKsControl), byref(ks))                  # IPart::Activate
+        _vcall(part, 12, [POINTER(c_void_p)], byref(ftopo))                    # IPart::GetTopologyObject
+        filter_id = ctypes.c_wchar_p()
+        _vcall(ftopo, 8, [POINTER(ctypes.c_wchar_p)], byref(filter_id))        # IDeviceTopology::GetDeviceId
+        try:
+            _vcall(en, 5, [ctypes.c_wchar_p, POINTER(c_void_p)], filter_id.value, byref(fdev))
+        finally:
+            ctypes.windll.ole32.CoTaskMemFree(filter_id)
+        _vcall(fdev, 3, [POINTER(GUID), wt.DWORD, c_void_p, POINTER(c_void_p)],
+               byref(IID_IKsControl), CLSCTX_ALL, None, byref(ks))            # IMMDevice::Activate
 
         class KSPROPERTY(ctypes.Structure):
             _fields_ = [("Set", GUID), ("Id", c_ulong), ("Flags", c_ulong)]
@@ -189,7 +237,7 @@ def _bt_request(endpoint_id, prop_id):
         _vcall(ks, 3, [POINTER(KSPROPERTY), c_ulong, c_void_p, c_ulong, POINTER(c_ulong)],
                byref(prop), ctypes.sizeof(prop), None, 0, byref(returned))
     finally:
-        for p in (ks, part, other, conn, topo, dev, en):
+        for p in (ks, fdev, ftopo, part, other, conn, topo, dev, en):
             _release(p)
 
 
@@ -255,6 +303,30 @@ def battery_levels():
 # Uses the Windows Runtime device APIs through the optional `winrt` packages.
 
 AUDIO_VIDEO_MAJOR_CLASS = 4      # Bluetooth "Class of Device": audio/video
+_MAJOR_KEY = "System.Devices.Aep.Bluetooth.Cod.Major"
+_found = {}                      # device id -> DeviceInformation from the last scan
+
+
+def _major_class(info):
+    """The device's Bluetooth major class, or None if it didn't report one.
+    Current winrt packages return property values boxed, so int() alone fails."""
+    try:
+        v = info.properties.lookup(_MAJOR_KEY)
+    except Exception:
+        return None
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except TypeError:
+        pass
+    import winrt.system as ws
+    for unbox in (ws.unbox_uint8, ws.unbox_uint32, ws.unbox_int32, ws.unbox_uint16):
+        try:
+            return int(unbox(v))
+        except Exception:
+            continue
+    return None
 
 
 def pairing_available():
@@ -276,27 +348,42 @@ async def scan_for_speakers(seconds, on_found, should_stop=lambda: False):
     if await BluetoothAdapter.get_default_async() is None:
         raise RuntimeError("This PC has no Bluetooth adapter, or it is switched off in Device Manager.")
 
-    major_key = "System.Devices.Aep.Bluetooth.Cod.Major"
-    watcher = DeviceInformation.create_watcher_with_kind_aqs_filter_and_additional_properties(
+    watcher = DeviceInformation.create_watcher(
         BluetoothDevice.get_device_selector_from_pairing_state(False),
-        [major_key, "System.Devices.Aep.IsPaired"],
+        [_MAJOR_KEY, "System.Devices.Aep.IsPaired"],
         DeviceInformationKind.ASSOCIATION_ENDPOINT)
-    seen = set()
+    _found.clear()
+    shown = set()
 
     def consider(info):
-        if info.id in seen or not info.name:
-            return
+        # Runs on a Windows thread: an exception here would vanish silently and
+        # the speaker would never be listed, so never let one escape.
         try:
-            major = info.properties.lookup(major_key)
+            if info.id in shown or not info.name:
+                return              # many speakers send their name in a later update
+            major = _major_class(info)
+            if major is not None and major != AUDIO_VIDEO_MAJOR_CLASS:
+                return
+            shown.add(info.id)
+            on_found(info.id, info.name)
         except Exception:
-            major = None
-        if major is not None and int(major) != AUDIO_VIDEO_MAJOR_CLASS:
-            return
-        seen.add(info.id)
-        on_found(info.id, info.name)
+            pass
 
-    watcher.add_added(lambda _w, info: consider(info))
-    watcher.add_updated(lambda _w, _u: None)     # required for the watcher to keep running
+    def added(_w, info):
+        _found[info.id] = info
+        consider(info)
+
+    def updated(_w, update):
+        info = _found.get(update.id)
+        if info is not None:
+            try:
+                info.update(update)
+            except Exception:
+                return
+            consider(info)
+
+    watcher.add_added(added)
+    watcher.add_updated(updated)
     watcher.start()
     try:
         for _ in range(int(seconds * 10)):
@@ -312,10 +399,13 @@ async def scan_for_speakers(seconds, on_found, should_stop=lambda: False):
 
 async def pair(device_id):
     """Pair with a speaker found by scan_for_speakers. Returns (ok, message)."""
-    from winrt.windows.devices.enumeration import (DeviceInformation, DevicePairingKinds,
-                                                   DevicePairingResultStatus)
+    from winrt.windows.devices.enumeration import (DeviceInformation, DeviceInformationKind,
+                                                   DevicePairingKinds, DevicePairingResultStatus)
 
-    info = await DeviceInformation.create_from_id_async(device_id)
+    # Use the scan's own object; looking the id up again needs the right kind
+    # (it's an association endpoint, not the default device interface).
+    info = _found.get(device_id) or await DeviceInformation.create_from_id_async(
+        device_id, [], DeviceInformationKind.ASSOCIATION_ENDPOINT)
     if info.pairing.is_paired:
         return True, "Already paired."
     custom = info.pairing.custom

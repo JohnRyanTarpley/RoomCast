@@ -23,6 +23,7 @@ class DeviceMonitor(QObject):
 
     updated = Signal(list, dict)                # endpoints, {container: battery %}
     reconnect_done = Signal(str, bool, str)     # speaker name, ok, message
+    disconnect_done = Signal(str, bool, str)    # speaker name, ok, message
 
     def __init__(self, interval=2.0, battery_every=30.0):
         super().__init__()
@@ -48,6 +49,9 @@ class DeviceMonitor(QObject):
 
     def request_reconnect(self, endpoint_id, name):
         self._jobs.put(("reconnect", endpoint_id, name))
+
+    def request_disconnect(self, endpoint_id, name):
+        self._jobs.put(("disconnect", endpoint_id, name))
 
     def _run(self):
         bt.com_init()
@@ -79,6 +83,14 @@ class DeviceMonitor(QObject):
                     self.reconnect_done.emit(name, True, "")
                 except OSError as e:
                     self.reconnect_done.emit(name, False, str(e))
+            elif job[0] == "disconnect":
+                _, endpoint_id, name = job
+                try:
+                    bt.disconnect(endpoint_id)
+                    self.disconnect_done.emit(name, True, "")
+                except OSError as e:
+                    self.disconnect_done.emit(name, False, str(e))
+                self._jobs.put(("poll",))       # show the new state straight away
 
 
 class _PairWorker(QObject):
@@ -102,7 +114,10 @@ class PairDialog(QDialog):
         self.worker.scan_done.connect(self._on_scan_done)
         self.worker.pair_done.connect(self._on_pair_done)
         self._stop_scan = False
-        self._busy = False
+        self._scanning = False
+        self._pairing = False
+        self._scan_idle = threading.Event()     # set while no search is running
+        self._scan_idle.set()
 
         v = QVBoxLayout(self)
         intro = QLabel("1. Switch the speaker on and put it in <b>pairing mode</b> (usually: hold its "
@@ -141,8 +156,9 @@ class PairDialog(QDialog):
             self._scan()
 
     def _update_buttons(self):
-        self.scan_btn.setEnabled(not self._busy)
-        self.pair_btn.setEnabled(not self._busy and self.list.currentItem() is not None)
+        # Pairing is allowed while the search is still running: it stops the search first.
+        self.scan_btn.setEnabled(not self._scanning and not self._pairing)
+        self.pair_btn.setEnabled(not self._pairing and self.list.currentItem() is not None)
 
     def _run_async(self, coro_fn):
         def target():
@@ -154,9 +170,10 @@ class PairDialog(QDialog):
 
     def _scan(self):
         self.list.clear()
-        self._busy, self._stop_scan = True, False
+        self._scanning, self._stop_scan = True, False
+        self._scan_idle.clear()
         self._update_buttons()
-        self.status.setText("Searching for speakers in pairing mode…")
+        self.status.setText("Searching for speakers in pairing mode… Select yours as soon as it appears.")
         w = self.worker
 
         async def job():
@@ -165,6 +182,8 @@ class PairDialog(QDialog):
                 w.scan_done.emit("")
             except Exception as e:
                 w.scan_done.emit(str(e) or type(e).__name__)
+            finally:
+                self._scan_idle.set()
         self._run_async(job)
 
     def _on_found(self, device_id, name):
@@ -175,8 +194,10 @@ class PairDialog(QDialog):
             self.list.setCurrentRow(0)
 
     def _on_scan_done(self, error):
-        self._busy = False
+        self._scanning = False
         self._update_buttons()
+        if self._pairing:
+            return                      # the pairing status stays on screen
         if error:
             self.status.setText(error)
         elif self.list.count() == 0:
@@ -187,17 +208,24 @@ class PairDialog(QDialog):
 
     def _pair(self):
         it = self.list.currentItem()
-        if it is None or self._busy:
+        if it is None or self._pairing:
             return
         self._stop_scan = True
-        self._busy = True
+        self._pairing = True
         self._update_buttons()
         name, device_id = it.text(), it.data(Qt.UserRole)
         self.status.setText("Pairing with %s…" % name)
         w = self.worker
+        idle = self._scan_idle
 
         async def job():
             try:
+                # Some Bluetooth adapters fail to pair while still searching; the
+                # search stops within a fraction of a second of being asked to.
+                for _ in range(30):
+                    if idle.is_set():
+                        break
+                    await asyncio.sleep(0.1)
                 ok, msg = await bt.pair(device_id)
             except Exception as e:
                 ok, msg = False, "Pairing failed: %s" % (str(e) or type(e).__name__)
@@ -205,7 +233,7 @@ class PairDialog(QDialog):
         self._run_async(job)
 
     def _on_pair_done(self, ok, message):
-        self._busy = False
+        self._pairing = False
         self._update_buttons()
         if ok:
             self.status.setText(message + " It will appear in the speaker list in a few seconds.")
