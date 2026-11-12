@@ -985,6 +985,39 @@ class MainWindow(QMainWindow):
                 self._mark_dropped(self.active[k].name)
         self._update_rows()
         self._save()
+        self._keep_source_default()
+
+    def _keep_source_default(self):
+        """When a Bluetooth speaker connects (especially right after pairing),
+        Windows makes it the default output. Apps then play straight to that
+        speaker and the source RoomCast records from goes silent: music stops
+        while the calibration click (made inside RoomCast) still works. If the
+        default is one of RoomCast's own speakers, point it back at the source."""
+        if bt is None or not self.engine.running:
+            return
+        i = self.src_combo.currentIndex()
+        if not 0 <= i < len(self.sources):
+            return
+        src_name = self.sources[i]["name"].replace(" [Loopback]", "")
+        try:
+            default = bt.default_output()
+        except OSError:
+            return
+        if (default is None or default["name"] == src_name
+                or default["name"] not in [s.name for s in self.active]):
+            return
+        src = self.endpoints.get(src_name)
+        if src is None or not src["connected"]:
+            return
+        try:
+            bt.set_default_output(src["id"])
+        except OSError:
+            self._flash("Windows is sending sound straight to %s, so RoomCast hears nothing. In Windows "
+                        "sound settings, set the output back to %s." % (default["name"], src_name), 15)
+            return
+        self._flash("Windows had switched its sound output to %s (it does that when a speaker "
+                    "connects). Switched it back to %s so your music plays through RoomCast."
+                    % (default["name"], src_name), 10)
 
     def _stop(self):
         self._restart_timer.stop()
@@ -1144,6 +1177,7 @@ class MainWindow(QMainWindow):
                         and now - self.last_auto.get(name, -1e9) > 30):
                     self.last_auto[name] = now
                     self.monitor.request_reconnect(e["id"], name)
+        self._keep_source_default()
         self._update_rows()
 
     def _reconnect(self, name):

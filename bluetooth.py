@@ -168,6 +168,42 @@ def list_endpoints():
     return res
 
 
+E_MULTIMEDIA = 1
+# IPolicyConfig: not in the public SDK, but stable since Windows 7 and what
+# sound-switcher tools use to change the default playback device.
+CLSID_PolicyConfig = GUID("870AF99C-171D-4F9E-AF0D-E63DF40C2BC9")
+IID_IPolicyConfig = GUID("F8679F50-850A-41CF-9C72-430F290290C8")
+
+
+def default_output():
+    """Windows' current default playback device (same fields as
+    list_endpoints()), or None. Unlike the audio library's answer, this is
+    always up to date."""
+    en = _enumerator()
+    dev = c_void_p()
+    try:
+        _vcall(en, 4, [ctypes.c_int, ctypes.c_int, POINTER(c_void_p)], E_RENDER, E_MULTIMEDIA, byref(dev))
+        return _device_info(dev)
+    except OSError:
+        return None
+    finally:
+        _release(dev)
+        _release(en)
+
+
+def set_default_output(endpoint_id):
+    """Make this playback device the Windows default (for apps and media).
+    Raises OSError if Windows refuses."""
+    p = c_void_p()
+    ctypes.oledll.ole32.CoCreateInstance(byref(CLSID_PolicyConfig), None, CLSCTX_ALL,
+                                         byref(IID_IPolicyConfig), byref(p))
+    try:
+        for role in (0, E_MULTIMEDIA):      # eConsole, eMultimedia (calls are left alone)
+            _vcall(p, 13, [ctypes.c_wchar_p, ctypes.c_int], endpoint_id, role)   # SetDefaultEndpoint
+    finally:
+        _release(p)
+
+
 def _bt_request(endpoint_id, prop_id):
     en = _enumerator()
     dev, topo, conn, other, part, ks = (c_void_p() for _ in range(6))
@@ -255,6 +291,30 @@ def battery_levels():
 # Uses the Windows Runtime device APIs through the optional `winrt` packages.
 
 AUDIO_VIDEO_MAJOR_CLASS = 4      # Bluetooth "Class of Device": audio/video
+_MAJOR_KEY = "System.Devices.Aep.Bluetooth.Cod.Major"
+_found = {}                      # device id -> DeviceInformation from the last scan
+
+
+def _major_class(info):
+    """The device's Bluetooth major class, or None if it didn't report one.
+    Current winrt packages return property values boxed, so int() alone fails."""
+    try:
+        v = info.properties.lookup(_MAJOR_KEY)
+    except Exception:
+        return None
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except TypeError:
+        pass
+    import winrt.system as ws
+    for unbox in (ws.unbox_uint8, ws.unbox_uint32, ws.unbox_int32, ws.unbox_uint16):
+        try:
+            return int(unbox(v))
+        except Exception:
+            continue
+    return None
 
 
 def pairing_available():
@@ -276,27 +336,42 @@ async def scan_for_speakers(seconds, on_found, should_stop=lambda: False):
     if await BluetoothAdapter.get_default_async() is None:
         raise RuntimeError("This PC has no Bluetooth adapter, or it is switched off in Device Manager.")
 
-    major_key = "System.Devices.Aep.Bluetooth.Cod.Major"
-    watcher = DeviceInformation.create_watcher_with_kind_aqs_filter_and_additional_properties(
+    watcher = DeviceInformation.create_watcher(
         BluetoothDevice.get_device_selector_from_pairing_state(False),
-        [major_key, "System.Devices.Aep.IsPaired"],
+        [_MAJOR_KEY, "System.Devices.Aep.IsPaired"],
         DeviceInformationKind.ASSOCIATION_ENDPOINT)
-    seen = set()
+    _found.clear()
+    shown = set()
 
     def consider(info):
-        if info.id in seen or not info.name:
-            return
+        # Runs on a Windows thread: an exception here would vanish silently and
+        # the speaker would never be listed, so never let one escape.
         try:
-            major = info.properties.lookup(major_key)
+            if info.id in shown or not info.name:
+                return              # many speakers send their name in a later update
+            major = _major_class(info)
+            if major is not None and major != AUDIO_VIDEO_MAJOR_CLASS:
+                return
+            shown.add(info.id)
+            on_found(info.id, info.name)
         except Exception:
-            major = None
-        if major is not None and int(major) != AUDIO_VIDEO_MAJOR_CLASS:
-            return
-        seen.add(info.id)
-        on_found(info.id, info.name)
+            pass
 
-    watcher.add_added(lambda _w, info: consider(info))
-    watcher.add_updated(lambda _w, _u: None)     # required for the watcher to keep running
+    def added(_w, info):
+        _found[info.id] = info
+        consider(info)
+
+    def updated(_w, update):
+        info = _found.get(update.id)
+        if info is not None:
+            try:
+                info.update(update)
+            except Exception:
+                return
+            consider(info)
+
+    watcher.add_added(added)
+    watcher.add_updated(updated)
     watcher.start()
     try:
         for _ in range(int(seconds * 10)):
@@ -312,10 +387,13 @@ async def scan_for_speakers(seconds, on_found, should_stop=lambda: False):
 
 async def pair(device_id):
     """Pair with a speaker found by scan_for_speakers. Returns (ok, message)."""
-    from winrt.windows.devices.enumeration import (DeviceInformation, DevicePairingKinds,
-                                                   DevicePairingResultStatus)
+    from winrt.windows.devices.enumeration import (DeviceInformation, DeviceInformationKind,
+                                                   DevicePairingKinds, DevicePairingResultStatus)
 
-    info = await DeviceInformation.create_from_id_async(device_id)
+    # Use the scan's own object; looking the id up again needs the right kind
+    # (it's an association endpoint, not the default device interface).
+    info = _found.get(device_id) or await DeviceInformation.create_from_id_async(
+        device_id, [], DeviceInformationKind.ASSOCIATION_ENDPOINT)
     if info.pairing.is_paired:
         return True, "Already paired."
     custom = info.pairing.custom
