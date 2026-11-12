@@ -23,6 +23,7 @@ class DeviceMonitor(QObject):
 
     updated = Signal(list, dict)                # endpoints, {container: battery %}
     reconnect_done = Signal(str, bool, str)     # speaker name, ok, message
+    disconnect_done = Signal(str, bool, str)    # speaker name, ok, message
 
     def __init__(self, interval=2.0, battery_every=30.0):
         super().__init__()
@@ -48,6 +49,9 @@ class DeviceMonitor(QObject):
 
     def request_reconnect(self, endpoint_id, name):
         self._jobs.put(("reconnect", endpoint_id, name))
+
+    def request_disconnect(self, endpoint_id, name):
+        self._jobs.put(("disconnect", endpoint_id, name))
 
     def _run(self):
         bt.com_init()
@@ -79,6 +83,14 @@ class DeviceMonitor(QObject):
                     self.reconnect_done.emit(name, True, "")
                 except OSError as e:
                     self.reconnect_done.emit(name, False, str(e))
+            elif job[0] == "disconnect":
+                _, endpoint_id, name = job
+                try:
+                    bt.disconnect(endpoint_id)
+                    self.disconnect_done.emit(name, True, "")
+                except OSError as e:
+                    self.disconnect_done.emit(name, False, str(e))
+                self._jobs.put(("poll",))       # show the new state straight away
 
 
 class _PairWorker(QObject):

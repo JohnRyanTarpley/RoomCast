@@ -31,8 +31,10 @@ Windows). Put a `RoomCast.ico` in `launcher/` before building to give it an icon
    speaker in pairing mode, and press **Pair** as soon as it appears in the
    list (or use Windows Settings > Bluetooth). Tick the speakers to use. Each one shows its
    connection state and, if the speaker reports it, its battery level.
-   Paired speakers that are switched off stay in the list with a
-   **Reconnect** button.
+   Connected Bluetooth speakers have a **Disconnect** button (they stay
+   paired, and RoomCast won't reconnect them by itself until you press
+   **Reconnect**). Paired speakers that are switched off stay in the list
+   with a **Reconnect** button.
 2. **Pick the audio source.** RoomCast records what Windows sends to one
    output device and redistributes it. That device must *not* be one of the
    ticked speakers. Two good choices:

@@ -205,8 +205,13 @@ def set_default_output(endpoint_id):
 
 
 def _bt_request(endpoint_id, prop_id):
+    """Send a one-shot request to the Bluetooth audio driver behind an endpoint.
+
+    The endpoint is connected to the driver's KS filter. IKsControl is not
+    available from that filter's IPart (E_NOINTERFACE), so look the filter up
+    as a device of its own and activate IKsControl on that instead."""
     en = _enumerator()
-    dev, topo, conn, other, part, ks = (c_void_p() for _ in range(6))
+    dev, topo, conn, other, part, ftopo, fdev, ks = (c_void_p() for _ in range(8))
     try:
         _vcall(en, 5, [ctypes.c_wchar_p, POINTER(c_void_p)], endpoint_id, byref(dev))
         _vcall(dev, 3, [POINTER(GUID), wt.DWORD, c_void_p, POINTER(c_void_p)],
@@ -214,8 +219,15 @@ def _bt_request(endpoint_id, prop_id):
         _vcall(topo, 4, [ctypes.c_uint, POINTER(c_void_p)], 0, byref(conn))    # GetConnector(0)
         _vcall(conn, 8, [POINTER(c_void_p)], byref(other))                      # GetConnectedTo
         _vcall(other, 0, [POINTER(GUID), POINTER(c_void_p)], byref(IID_IPart), byref(part))
-        _vcall(part, 13, [wt.DWORD, POINTER(GUID), POINTER(c_void_p)],
-               CLSCTX_ALL, byref(IID_IKsControl), byref(ks))                  # IPart::Activate
+        _vcall(part, 12, [POINTER(c_void_p)], byref(ftopo))                    # IPart::GetTopologyObject
+        filter_id = ctypes.c_wchar_p()
+        _vcall(ftopo, 8, [POINTER(ctypes.c_wchar_p)], byref(filter_id))        # IDeviceTopology::GetDeviceId
+        try:
+            _vcall(en, 5, [ctypes.c_wchar_p, POINTER(c_void_p)], filter_id.value, byref(fdev))
+        finally:
+            ctypes.windll.ole32.CoTaskMemFree(filter_id)
+        _vcall(fdev, 3, [POINTER(GUID), wt.DWORD, c_void_p, POINTER(c_void_p)],
+               byref(IID_IKsControl), CLSCTX_ALL, None, byref(ks))            # IMMDevice::Activate
 
         class KSPROPERTY(ctypes.Structure):
             _fields_ = [("Set", GUID), ("Id", c_ulong), ("Flags", c_ulong)]
@@ -225,7 +237,7 @@ def _bt_request(endpoint_id, prop_id):
         _vcall(ks, 3, [POINTER(KSPROPERTY), c_ulong, c_void_p, c_ulong, POINTER(c_ulong)],
                byref(prop), ctypes.sizeof(prop), None, 0, byref(returned))
     finally:
-        for p in (ks, part, other, conn, topo, dev, en):
+        for p in (ks, fdev, ftopo, part, other, conn, topo, dev, en):
             _release(p)
 
 
