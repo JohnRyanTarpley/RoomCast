@@ -12,6 +12,7 @@ __pycache__/
 # Packaging / build output (e.g. PyInstaller, setuptools)
 build/
 dist/
+tools/
 *.spec
 *.egg-info/
 .eggs/
