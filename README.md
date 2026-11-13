@@ -67,12 +67,21 @@ Windows; stereo sources are upmixed (optional).
   again, with its delay and position kept.
 - A returning speaker can end up slightly late: right after reconnecting its
   Bluetooth link is unsteady and the speaker may enlarge its own buffer. So
-  it reconnects silently, and after 8 s RoomCast closes just that speaker for
+  it reconnects silently, and after 3.5 s RoomCast closes just that speaker for
   2 s and brings it back on a now-steady link. Only then does it play again,
   so it doesn't cut in and out before it is in time; the others keep playing
   (**Resync a speaker after it comes back**, can be switched off). If speakers still
   sound out of step, the **Resync** button next to Stop restarts all of them
   for about two seconds, the same as pressing Stop and Start.
+- Many Bluetooth speakers tell the PC to pause as they switch off, which
+  would pause your music on every speaker. When your music pauses, RoomCast
+  checks whether a speaker has just gone. If one has, the music plays on
+  after a few seconds (**Keep the music playing when a speaker is switched
+  off**, can be switched off). Pausing on purpose, from a speaker's button or
+  the PC, still pauses. Some speakers switch off without telling Windows, and
+  Windows takes about 20 s to notice; until then the remaining speakers can
+  stutter, and in Surround the missing speaker's channels move over once
+  Windows has noticed.
 - Short pauses on one speaker (common when a phone is also connected to it,
   even if the phone isn't playing anything) are ridden out without resyncing
   or restarting anything. For the most reliable playback, disconnect phones
@@ -178,6 +187,22 @@ Key design points:
   lifts any hold at once. The Resync
   button (`MainWindow._resync`) closes every stream, waits 1.5 s for Windows
   to close the Bluetooth audio links, then re-scans and starts again.
+- **Switched-off speakers (`pauseguard.py`).** A speaker's AVRCP pause reaches
+  the media app straight from Windows (no input event to intercept), and
+  Windows only marks a speaker that switched off without disconnecting
+  cleanly as gone after its ~20 s link timeout. `PauseGuard` watches the media
+  sessions; when one goes from playing to paused it asks the playing speakers
+  an uncached SDP query (`get_rfcomm_services_async`) at 1.5 s and 3.5 s, one
+  at a time. While Windows is still trying to reach a switched-off speaker,
+  every speaker's query hangs, so a query that doesn't answer within 2 s means
+  some speaker has gone but not which: the paused sessions are resumed
+  (`try_play_async`) and the speaker is dropped as usual once Windows marks it
+  disconnected. If every speaker answers, the pause stands. `Engine.drop`
+  closes streams on a background thread, since closing one while the
+  Bluetooth stack is stuck can block for half a minute. Addresses come from the `BTHENUM\Dev_<address>` device
+  node with the endpoint's container id (`bluetooth.bluetooth_addresses`).
+- **Diagnostic log.** Connection events go to `%APPDATA%\RoomCast\roomcast.log`
+  (`diag.py`, 500 kB, one backup).
 - **Unrelated device changes don't interrupt playback.** Endpoints that come
   and go without affecting playback (another speaker, a hands-free endpoint
   flickering because a phone connected to a speaker) just update the list.

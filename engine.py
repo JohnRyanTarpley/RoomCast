@@ -97,6 +97,8 @@ class SpeakerOut:
         self.underruns = 0
         self.beep = None
         self.t_pull = time.perf_counter()   # last time the device asked for audio
+        self.max_gap = 0.0    # longest time between two requests for audio (see pull_stats)
+        self.pulled = 0       # frames requested since pull_stats was last called
         self.lock = threading.Lock()
 
     def reset(self):
@@ -163,7 +165,12 @@ class SpeakerOut:
             return out
 
     def pull(self, n_out):
-        self.t_pull = time.perf_counter()
+        now = time.perf_counter()
+        gap = now - self.t_pull
+        if gap > self.max_gap:
+            self.max_gap = gap
+        self.pulled += n_out
+        self.t_pull = now
         out = self._read(n_out)
         out = out * (0.0 if self.mute or self.held else self.volume)
         beep = self.beep
@@ -209,6 +216,7 @@ class Engine:
         self._rejoined = []           # (speaker index, stream or None)
         self._warming = set()         # rejoined speakers not yet given their surround channels
         self._fade = None             # [matrix faded from, matrix faded to, progress 0..1]
+        self._closing = []            # threads closing dropped speakers' streams (see drop())
 
     # ---- lifecycle ---------------------------------------------------
     def start(self, source: dict, outputs: list, settings: MixSettings):
@@ -255,9 +263,10 @@ class Engine:
         with self._lock:
             self._gen += 1
             late, self._rejoined = [s for _, s in self._rejoined], []
-        for t in self._pending.values():    # the device re-scan after a stop needs them finished
-            t.join(timeout=5.0)
+        for t in list(self._pending.values()) + self._closing:   # the device re-scan after a
+            t.join(timeout=5.0)                                     # stop needs them finished
         self._pending = {}
+        self._closing = []
         self._warming = set()
         for s in self._out_streams + [self._capture] + late:
             self._close(s)
@@ -284,12 +293,17 @@ class Engine:
 
     def drop(self, i):
         """Close one speaker's stream; the other speakers keep playing (in
-        surround, its channels are re-panned onto them)."""
+        surround, its channels are re-panned onto them). The stream is closed
+        on a thread of its own: closing a Bluetooth speaker's stream can hang
+        for half a minute while Windows is still trying to reach it."""
         if 0 <= i < len(self._out_streams) and self._out_streams[i] is not None:
             s, self._out_streams[i] = self._out_streams[i], None
             self._warming.discard(i)
-            self._close(s)
             self._reapply()
+            self._closing = [t for t in self._closing if t.is_alive()]
+            t = threading.Thread(target=self._close, args=(s,), name="close", daemon=True)
+            self._closing.append(t)
+            t.start()
 
     def index_of(self, name):
         return next((i for i, o in enumerate(self.outs) if o.name == name), None)
@@ -473,6 +487,18 @@ class Engine:
                 o.beep = beep_tone(rate)
                 return True
         return False
+
+    def pull_stats(self):
+        """Per open speaker: (name, longest gap between requests for audio in s,
+        frames requested per second of its device rate) since the last call.
+        Only for the diagnostic log."""
+        res = []
+        for i, o in enumerate(self.outs):
+            gap, frames = o.max_gap, o.pulled
+            o.max_gap, o.pulled = 0.0, 0
+            if self.is_open(i):
+                res.append((o.name, gap, frames, self._dev_rates[i]))
+        return res
 
     def levels(self):
         lv = []

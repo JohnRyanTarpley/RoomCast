@@ -10,6 +10,8 @@ from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
                                QPushButton, QVBoxLayout)
 
+from diag import log
+
 try:
     import bluetooth as bt
 except Exception:           # not on Windows
@@ -18,8 +20,10 @@ except Exception:           # not on Windows
 
 class DeviceMonitor(QObject):
     """Polls Windows for speaker connection state (every couple of seconds)
-    and battery levels (every 30 s) on a background thread, and carries out
-    reconnect requests there so the window never freezes."""
+    and battery levels (every 30 s) on a background thread. Reconnect and
+    disconnect requests each run on a thread of their own: asking Windows to
+    reconnect a speaker that is switched off can take a long time, and the
+    polling must keep going meanwhile or a speaker coming back is missed."""
 
     updated = Signal(list, dict)                # endpoints, {container: battery %}
     reconnect_done = Signal(str, bool, str)     # speaker name, ok, message
@@ -30,6 +34,8 @@ class DeviceMonitor(QObject):
         self.interval, self.battery_every = interval, battery_every
         self._jobs = queue.Queue()
         self._running = False
+        self._busy = set()                      # endpoint ids with a request under way
+        self._busy_lock = threading.Lock()
 
     @property
     def available(self):
@@ -48,19 +54,57 @@ class DeviceMonitor(QObject):
         self._jobs.put(("poll",))
 
     def request_reconnect(self, endpoint_id, name):
-        self._jobs.put(("reconnect", endpoint_id, name))
+        self._request("reconnect", endpoint_id, name)
 
     def request_disconnect(self, endpoint_id, name):
-        self._jobs.put(("disconnect", endpoint_id, name))
+        self._request("disconnect", endpoint_id, name)
+
+    def _request(self, kind, endpoint_id, name):
+        if not self.available:
+            return
+        with self._busy_lock:
+            if endpoint_id in self._busy:
+                log.info("%s %s: previous request still under way, skipped", kind, name)
+                return
+            self._busy.add(endpoint_id)
+        threading.Thread(target=self._do_request, args=(kind, endpoint_id, name),
+                         name=kind, daemon=True).start()
+
+    def _do_request(self, kind, endpoint_id, name):
+        bt.com_init()
+        done = self.reconnect_done if kind == "reconnect" else self.disconnect_done
+        fn = bt.reconnect if kind == "reconnect" else bt.disconnect
+        t0 = time.monotonic()
+        log.info("%s %s: requested", kind, name)
+        try:
+            fn(endpoint_id)
+            ok, msg = True, ""
+        except OSError as e:
+            ok, msg = False, str(e)
+        finally:
+            with self._busy_lock:
+                self._busy.discard(endpoint_id)
+        log.info("%s %s: %s after %.1f s%s", kind, name, "ok" if ok else "failed",
+                 time.monotonic() - t0, " (%s)" % msg if msg else "")
+        done.emit(name, ok, msg)
+        self.poll_now()                         # show the new state straight away
 
     def _run(self):
         bt.com_init()
-        battery, last_battery, last_ids = {}, 0.0, None
+        battery, addresses, last_battery, last_ids = {}, {}, 0.0, None
+        seen = {}                               # endpoint name -> last logged state
         while self._running:
             try:
                 endpoints = bt.list_endpoints()
-            except OSError:
+            except OSError as e:
+                log.info("listing endpoints failed: %s", e)
                 endpoints = []
+            for e in endpoints:
+                if e["bluetooth"]:
+                    st = "connected" if e["connected"] else "not connected (state %d)" % e["state"]
+                    if seen.get(e["name"]) != st:
+                        seen[e["name"]] = st
+                        log.info("Windows: %s is %s", e["name"], st)
             ids = sorted((e["id"], e["state"]) for e in endpoints)
             now = time.monotonic()
             if ids != last_ids or now - last_battery > self.battery_every:
@@ -68,7 +112,14 @@ class DeviceMonitor(QObject):
                     battery = bt.battery_levels()
                 except OSError:
                     battery = {}
+                if ids != last_ids:
+                    try:
+                        addresses = bt.bluetooth_addresses()
+                    except OSError:
+                        addresses = {}
                 last_battery, last_ids = now, ids
+            for e in endpoints:
+                e["address"] = addresses.get(e["container"])
             self.updated.emit(endpoints, battery)
             try:
                 job = self._jobs.get(timeout=self.interval)
@@ -76,21 +127,6 @@ class DeviceMonitor(QObject):
                 continue
             if job is None:
                 break
-            if job[0] == "reconnect":
-                _, endpoint_id, name = job
-                try:
-                    bt.reconnect(endpoint_id)
-                    self.reconnect_done.emit(name, True, "")
-                except OSError as e:
-                    self.reconnect_done.emit(name, False, str(e))
-            elif job[0] == "disconnect":
-                _, endpoint_id, name = job
-                try:
-                    bt.disconnect(endpoint_id)
-                    self.disconnect_done.emit(name, True, "")
-                except OSError as e:
-                    self.disconnect_done.emit(name, False, str(e))
-                self._jobs.put(("poll",))       # show the new state straight away
 
 
 class _PairWorker(QObject):

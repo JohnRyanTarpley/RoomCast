@@ -299,6 +299,28 @@ def battery_levels():
     return res
 
 
+def bluetooth_addresses():
+    """{container id: Bluetooth address (int)} for every present classic
+    Bluetooth device. The container id is the one list_endpoints() reports,
+    so this links a speaker's audio endpoint to its radio address."""
+    res = {}
+    for inst in _present_ids("BTHENUM"):
+        head = inst.split("\\")
+        if len(head) < 2 or not head[1].upper().startswith("DEV_"):
+            continue
+        try:
+            addr = int(head[1][4:], 16)
+        except ValueError:
+            continue
+        devinst = c_ulong()
+        if _cfg.CM_Locate_DevNodeW(byref(devinst), inst, 0) != 0:
+            continue
+        _, cdata = _devnode_prop(devinst, PKEY_Device_ContainerId)
+        if cdata and len(cdata) >= 16:
+            res[str(GUID.from_buffer_copy(cdata[:16]))] = addr
+    return res
+
+
 # ------------------------------------------------------------------ pairing
 # Uses the Windows Runtime device APIs through the optional `winrt` packages.
 

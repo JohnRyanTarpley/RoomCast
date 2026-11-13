@@ -8,3 +8,6 @@ winrt-Windows.Foundation>=4!10.0.28000
 winrt-Windows.Foundation.Collections>=4!10.0.28000
 winrt-Windows.Devices.Enumeration>=4!10.0.28000
 winrt-Windows.Devices.Bluetooth>=4!10.0.28000
+# Keep music playing when a speaker is switched off (pauseguard.py)
+winrt-Windows.Devices.Bluetooth.Rfcomm>=4!10.0.28000
+winrt-Windows.Media.Control>=4!10.0.28000
