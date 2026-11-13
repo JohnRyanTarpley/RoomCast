@@ -21,9 +21,7 @@ speakers at once, in one of three modes:
    console window.
 
 `RoomCast.exe` is a small launcher that runs `Run RoomCast.bat`. It must stay in
-the RoomCast folder. To rebuild it after changing `launcher/RoomCast.cs`, run
-`launcher\build.bat` (no extra tools needed; it uses the C# compiler built into
-Windows). Put a `RoomCast.ico` in `launcher/` before building to give it an icon.
+the RoomCast folder.
 
 ## Using it
 
@@ -70,7 +68,8 @@ Windows; stereo sources are upmixed (optional).
   position kept, and stays silent until it is in time with the others.
 - RoomCast reconnects ticked speakers that have disconnected.
 - All speakers are resynced whenever the music pauses. If they still sound
-  out of step, press **Resync**.
+  out of step, press **Resync**: it pauses the music, lines the speakers up
+  and carries on where it left off.
 - Pressing **Stop** also pauses the music on your PC.
 
 Most of these can be switched off with the checkboxes in RoomCast.

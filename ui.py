@@ -28,6 +28,11 @@ from room_view import LISTENER, RoomView
 COLORS = ["#ff6b6b", "#4dabf7", "#51cf66", "#fcc419", "#cc5de8", "#ff922b", "#22b8cf", "#f783ac"]
 MODES = ["surround", "frequency", "sync"]
 CONFIG = Path(os.environ.get("APPDATA", Path.home())) / "RoomCast" / "settings.json"
+try:                                    # same file the launcher's build stamps into RoomCast.exe
+    VERSION = (Path(__file__).parent / "VERSION").read_text("utf-8").strip()
+except OSError:
+    VERSION = ""
+STOPPED = "Stopped" + (" · RoomCast %s" % VERSION if VERSION else "")
 
 
 @dataclass
@@ -557,7 +562,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self.start_btn, 1)
         row.addWidget(self.resync_btn)
         bottom.addLayout(row)
-        self.status = hint("Stopped")
+        self.status = hint(STOPPED)
         bottom.addWidget(self.status)
         lw = QWidget()
         lw.setLayout(bottom)
@@ -1109,7 +1114,7 @@ class MainWindow(QMainWindow):
         self.start_btn.setChecked(False)
         self.start_btn.setText("Start")
         self.resync_btn.setEnabled(False)
-        self.status.setText("Stopped")
+        self.status.setText(STOPPED)
         for m in getattr(self, "meters", []):
             m.setValue(0)
         self._update_rows()
@@ -1127,6 +1132,7 @@ class MainWindow(QMainWindow):
             self.refresh_devices()
 
     RESYNC_GAP_MS = 1500    # long enough for Windows to close the Bluetooth audio links
+    RESUME_AFTER_RESYNC_MS = 700    # Bluetooth speakers swallow the first moment after waking
     SETTLE_S = 3.5          # a returned speaker stays connected (silent) this long before its own reset ...
     RESET_GAP_MS = 2000     # ... which closes it for this long
 
@@ -1179,6 +1185,8 @@ class MainWindow(QMainWindow):
         if not self.start_btn.isChecked() or self._resyncing:
             return
         log.info("resync all speakers%s", " (the music paused)" if on_pause else "")
+        if not on_pause:
+            self.guard.pause_all(remember=True)     # resumed where it left off once restarted
         self._resync_on_pause = on_pause
         self._resyncing = True
         self.resync_after.clear()
@@ -1204,6 +1212,8 @@ class MainWindow(QMainWindow):
             self._start(quiet=True, skip_dropped=True)
         else:
             self.refresh_devices()      # re-scans (picks up the returned speaker) and starts
+            if self.engine.running:     # give the speakers a moment to wake before the music
+                QTimer.singleShot(self.RESUME_AFTER_RESYNC_MS, self.guard.resume)
 
     def _set_keep_playing(self, on):
         self.opts["keep_playing"] = on
@@ -1602,6 +1612,7 @@ class MainWindow(QMainWindow):
         playing = len(self.engine.outs) - len(self.engine.stalled())
         waiting = [n for n in self.checked if n not in [o.name for o in self.engine.outs]]
         self.status.setText("Running · %d speaker(s) playing%s · source %d ch @ %d Hz\n"
-                            "Speaker dropouts: %d · buffer gaps: %d" % (
+                            "Speaker dropouts: %d · buffer gaps: %d%s" % (
             playing, " · %d waiting to reconnect" % len(waiting) if waiting else "",
-            self.engine.n_in, self.engine.src_rate, self.dropout_count, self.engine.underruns()))
+            self.engine.n_in, self.engine.src_rate, self.dropout_count, self.engine.underruns(),
+            " · RoomCast %s" % VERSION if VERSION else ""))

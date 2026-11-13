@@ -52,6 +52,8 @@ class PauseGuard(QObject):
         self.available = self._check_available()
         self._loop = None               # the guard thread's event loop, once running
         self._mgr = None                # media session manager, once running
+        self._ours = {}                 # app id -> when RoomCast itself paused it (not a speaker)
+        self._to_resume = []            # sessions pause_all(remember=True) paused, for resume()
 
     @staticmethod
     def _check_available():
@@ -104,6 +106,9 @@ class PauseGuard(QObject):
                     continue
                 is_playing = st == Status.PLAYING
                 if playing.get(app) and st == Status.PAUSED:
+                    if now - self._ours.pop(app, -1e9) < 5.0:
+                        playing[app] = False    # RoomCast paused it itself: nothing to check
+                        continue
                     paused_at[app] = (now, s)
                     fresh.append(app)
                 elif is_playing:
@@ -121,26 +126,49 @@ class PauseGuard(QObject):
                     self._busy = True
                     asyncio.ensure_future(self._check(speakers, paused_at))
 
-    def pause_all(self):
-        """Pause every app that is playing media (used when RoomCast is
-        stopped). Safe to call from any thread; does nothing if unavailable."""
+    def pause_all(self, remember=False):
+        """Pause every app that is playing media (when RoomCast is stopped, or
+        around a Resync). remember=True keeps them for resume(). Safe to call
+        from any thread; does nothing if unavailable."""
         if self._loop is not None:
-            asyncio.run_coroutine_threadsafe(self._pause_all(), self._loop)
+            asyncio.run_coroutine_threadsafe(self._pause_all(remember), self._loop)
 
-    async def _pause_all(self):
+    def resume(self):
+        """Play again the apps the last pause_all(remember=True) paused."""
+        if self._loop is not None:
+            asyncio.run_coroutine_threadsafe(self._resume(), self._loop)
+
+    async def _pause_all(self, remember):
         from winrt.windows.media.control import (
             GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status)
         try:
             sessions = list(self._mgr.get_sessions())
         except Exception:
             return
+        self._to_resume = []
         for s in sessions:
             try:
                 if s.get_playback_info().playback_status == Status.PLAYING:
+                    app = s.source_app_user_model_id
+                    self._ours[app] = time.monotonic()
                     await s.try_pause_async()
-                    log.info("paused %s because RoomCast was stopped", s.source_app_user_model_id)
+                    if remember:
+                        self._to_resume.append(s)
+                    log.info("paused %s for RoomCast", app)
             except Exception as e:
                 log.info("couldn't pause a media app: %s", e)
+
+    async def _resume(self):
+        from winrt.windows.media.control import (
+            GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status)
+        sessions, self._to_resume = self._to_resume, []
+        for s in sessions:
+            try:
+                if s.get_playback_info().playback_status == Status.PAUSED:   # not stopped meanwhile
+                    await s.try_play_async()
+                    log.info("resumed %s after the resync", s.source_app_user_model_id)
+            except Exception as e:
+                log.info("couldn't resume a media app: %s", e)
 
     async def _check(self, speakers, paused_at):
         self.checking.emit(True)
