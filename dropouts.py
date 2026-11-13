@@ -323,6 +323,7 @@ class DropoutHandling:
                     self.monitor.request_reconnect(e["id"], name)
         self._keep_source_default()
         self._update_rows()
+        self._update_source_hint()              # Windows may have switched its output
 
     def _reconnect(self, name):
         e = self.endpoints.get(name)

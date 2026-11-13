@@ -21,7 +21,8 @@ speakers at once, in one of three modes:
    console window.
 
 `RoomCast.exe` is a small launcher that runs `Run RoomCast.bat`. It must stay in
-the RoomCast folder.
+the RoomCast folder. Only one RoomCast runs at a time: starting it again brings
+the open window to the front.
 
 ## Using it
 
@@ -35,17 +36,23 @@ the RoomCast folder.
    paired, and RoomCast won't reconnect them by itself until you press
    **Reconnect**). Paired speakers that are switched off stay in the list
    with a **Reconnect** button.
-2. **Pick the audio source.** RoomCast records what Windows sends to one
-   output device and redistributes it. That device must *not* be one of the
-   ticked speakers. Two good choices:
-   - the PC's built-in output with its volume turned to zero, or
-   - a virtual device such as VB-CABLE set as the Windows default output
-     (cleanest: nothing audible plays except through RoomCast).
+2. **Check the audio source.** RoomCast records what Windows plays through
+   one output device (the source) and sends it to the speakers, so the
+   source must be the device Windows plays through, and must *not* be one of
+   the speakers. Until you choose one yourself, RoomCast picks it: the device
+   Windows plays through if that isn't a speaker, otherwise a virtual cable,
+   otherwise a wired output. Two good sources:
+   - a virtual device such as VB-CABLE (cleanest: nothing plays out loud
+     except through RoomCast), or
+   - the PC's built-in output with its volume turned all the way down.
 
-   Windows makes a Bluetooth speaker its default output when it connects
-   (especially right after pairing), so apps play straight to that one
-   speaker and RoomCast hears nothing. While playing, RoomCast notices this
-   and switches the Windows default back to the source device, with a note in
+   The line under the source says whether it works, and why not if it
+   doesn't. If Windows is playing through a different device, press
+   **Play Windows sound through this**.
+   Windows also makes a Bluetooth speaker its default output when it
+   connects (especially right after pairing), so apps play straight to that
+   one speaker and RoomCast hears nothing. While playing, RoomCast notices
+   this and switches the Windows default back to the source, with a note in
    the status line.
 3. **Choose a mode and press Start.**
 4. **Calibrate the timing.** Every Bluetooth speaker adds its own lag
@@ -84,6 +91,9 @@ RoomCast.
   good USB Bluetooth 5.x adapter helps if speakers keep dropping out.
 - Speakers with a microphone show up twice in Windows. RoomCast hides the
   low-quality "Hands-Free" output and warns if a speaker is stuck in it.
+- If something goes wrong, `%APPDATA%\RoomCast\roomcast.log` records what
+  happened: dropouts, reconnects and any unexpected errors. Include it when
+  reporting a problem.
 
 ### Video and lip-sync
 
@@ -132,8 +142,8 @@ delay. Workarounds:
 
 | File | Role |
 | --- | --- |
-| `main.py` | Entry point. |
-| `ui.py` | Main window: device list, mode pages, per-speaker table, start/stop/resync, settings persistence (`%APPDATA%\RoomCast\settings.json`). |
+| `main.py` | Entry point: single-instance check and logging of unexpected errors. |
+| `ui.py` | Main window: device list, audio source and its hint, mode pages, per-speaker table, start/stop/resync, settings persistence (`%APPDATA%\RoomCast\settings.json`). |
 | `dropouts.py` | Speakers leaving and returning: `Link`, each speaker's connection record, and the main window's dropout, rejoin and Reconnect/Disconnect handling. |
 | `widgets.py` | Dark theme and reusable widgets (speaker list row, frequency band view, wrapping layout). |
 | `room_view.py` | Orbitable 3D room editor drawn with QPainter (no OpenGL needed). |
@@ -143,7 +153,7 @@ delay. Workarounds:
 | `bluetooth.py` | Windows device APIs: endpoint state incl. disconnected paired speakers and hands-free detection (Core Audio via ctypes), one-shot Bluetooth reconnect (`IKsControl`), battery level (`cfgmgr32`), scanning and pairing (WinRT via `winrt-*`). No drivers or admin rights. |
 | `connection.py` | `DeviceMonitor` (background polling: state every 2 s, battery every 30 s; runs reconnects off the GUI thread) and the pairing dialog. |
 | `pauseguard.py` | Watches media apps: resumes the music when a speaker switching off paused it, triggers the resync on pause, and pauses the music when RoomCast is stopped. |
-| `diag.py` | Diagnostic log of connection events. |
+| `diag.py` | Diagnostic log of connection events and unexpected errors. |
 
 Key design points:
 
@@ -197,7 +207,27 @@ Key design points:
   background threads (`Engine.start`, `Engine.stop`, `Engine.drop`), since
   they can hang for many seconds while Bluetooth is stalled.
 - **Diagnostic log.** Connection events go to `%APPDATA%\RoomCast\roomcast.log`
-  (`diag.py`).
+  (`diag.py`). RoomCast runs without a console, so `main.py` also sends any
+  unexpected error there, from the window or a background thread, with its
+  traceback (each distinct error once), and tells the user about errors in
+  the window.
+- **Settings survive bad data.** `settings.json` is written to a temporary
+  file and swapped in, so a crash mid-save can't leave a half-written file.
+  On loading, anything missing or invalid keeps its default and the rest
+  still loads (`SpeakerCfg.from_dict`, `same_kind`); a file that can't be
+  read at all is kept as `settings.broken.json` and RoomCast starts with
+  defaults.
+- **One copy at a time.** `main.py` claims a per-user local server name
+  (`QLocalServer`); a second copy asks the first to show its window and
+  exits, so two copies never fight over the speakers.
+- **Audio source.** The source is the loopback of an output device. Until
+  the user chooses one, RoomCast picks the Windows default output if it
+  isn't a speaker, then a virtual cable, then a wired output
+  (`MainWindow._auto_source`), and picks again if that device is ticked as a
+  speaker. A choice the user made is kept. The hint under the source
+  (`MainWindow._update_source_hint`, refreshed on every device poll) warns
+  when it is a ticked speaker (feedback), a Bluetooth speaker (it would also
+  play directly), or not the device Windows plays through.
 - **Unrelated device changes don't interrupt playback.** Endpoints that come
   and go without affecting playback (another speaker, a hands-free endpoint
   flickering because a phone connected to a speaker) just update the list.
