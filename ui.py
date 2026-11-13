@@ -492,9 +492,10 @@ class MainWindow(QMainWindow):
         v.addLayout(row)
         cb = QCheckBox("Resync a speaker after it comes back")
         cb.setToolTip("A speaker that returns after dropping out can end up slightly late. With this "
-                      "on, once it has played for %d s RoomCast closes just that speaker for %d s and "
-                      "brings it back in time; the others keep playing. If it is still out of step, "
-                      "press Resync." % (self.SETTLE_S, self.RESET_GAP_MS // 1000))
+                      "on, it reconnects silently; after %d s RoomCast closes just that speaker for "
+                      "%d s and brings it back in time, and only then does it play again. The others "
+                      "keep playing. If it is still out of step, press Resync."
+                      % (self.SETTLE_S, self.RESET_GAP_MS // 1000))
         cb.setChecked(bool(self.opts["auto_resync"]))
         cb.toggled.connect(lambda on: self.opts.__setitem__("auto_resync", on))
         v.addWidget(cb)
@@ -1091,7 +1092,7 @@ class MainWindow(QMainWindow):
             self.refresh_devices()
 
     RESYNC_GAP_MS = 1500    # long enough for Windows to close the Bluetooth audio links
-    SETTLE_S = 8.0          # a returned speaker plays this long before its own reset ...
+    SETTLE_S = 3.5          # a returned speaker stays connected (silent) this long before its own reset ...
     RESET_GAP_MS = 2000     # ... which closes it for this long
 
     def _reset_speaker(self, name):
@@ -1206,8 +1207,13 @@ class MainWindow(QMainWindow):
                 if ok:
                     self.dropped.pop(name, None)
                     self.rejoin_fails.pop(name, None)
-                    if not was_reset:           # back from a dropout: reset it once it settles
+                    # Back from a dropout: keep it silent until it has settled and had
+                    # its own reset, so it doesn't play late and then cut out again.
+                    # Back from that reset: let it play.
+                    hold = not was_reset and self.opts["auto_resync"]
+                    if hold:
                         self.resync_after[name] = None
+                    self.engine.hold(i, hold)
                     continue
                 fails = self.rejoin_fails[name] = self.rejoin_fails.get(name, 0) + 1
                 gone = self.dropped.get(name, {}).get("gone", False)
@@ -1232,6 +1238,9 @@ class MainWindow(QMainWindow):
                 i = self.engine.index_of(name)
                 if i is None or not self.engine.is_open(i) or not self.opts["auto_resync"]:
                     del self.resync_after[name]         # dropped again, or switched off
+                    if i is not None and self.engine.is_open(i):
+                        self.engine.hold(i, False)      # switched off: play it as it is
+                    self._update_rows()
                 elif not self.engine.is_playing(i):
                     self.resync_after[name] = None
                 elif t is None:
@@ -1410,7 +1419,9 @@ class MainWindow(QMainWindow):
                 return "Disconnected. RoomCast keeps trying to reconnect it.", RED, True, True
             return "Disconnected (paired). Switch it on or press Reconnect.", GREY, True, True
         if name in self.resetting and name not in self.dropped:
-            return "Resyncing this speaker (the others keep playing)…", AMBER, False, True
+            return "Resyncing this speaker…", AMBER, False, True
+        if name in self.resync_after and name not in self.dropped:
+            return "Back. Stabilizing connection…", AMBER, False, True
         if name in self.dropped:
             if self.dropped[name].get("rejoining"):
                 return "Back. Rejoining playback…", AMBER, False, True

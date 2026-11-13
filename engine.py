@@ -92,6 +92,7 @@ class SpeakerOut:
         self.t_ok = time.perf_counter()   # last time the delay was close to the target
         self.volume = 1.0
         self.mute = False
+        self.held = False     # kept silent until the GUI has resynced it (see Engine.hold)
         self.peak = 0.0
         self.underruns = 0
         self.beep = None
@@ -164,7 +165,7 @@ class SpeakerOut:
     def pull(self, n_out):
         self.t_pull = time.perf_counter()
         out = self._read(n_out)
-        out = out * (0.0 if self.mute else self.volume)
+        out = out * (0.0 if self.mute or self.held else self.volume)
         beep = self.beep
         if beep is not None:
             k = min(len(beep), n_out)
@@ -300,6 +301,16 @@ class Engine:
         """True once a speaker is open, taking audio and past its warm-up."""
         return self.is_open(i) and self.outs[i].primed and i not in self._warming
 
+    def hold(self, i, on):
+        """Keep an open speaker silent (it still takes audio, so it stays
+        connected and in time) or let it play again. Used on a speaker that
+        came back after a dropout until its own resync has run, so it doesn't
+        cut in late and then cut out for the resync. In surround, its channels
+        stay on the other speakers meanwhile."""
+        if 0 <= i < len(self.outs) and self.outs[i].held != on:
+            self.outs[i].held = on
+            self._reapply()
+
     def rejoin(self, i):
         """Reopen a dropped speaker in the background while the others keep
         playing. It comes back time-aligned with them. The result arrives
@@ -366,7 +377,8 @@ class Engine:
             # Pan only onto speakers that are playing, so a dropped speaker's
             # channels aren't lost. Delay and level compensation still use every
             # speaker, so the others' timing doesn't move when one drops out.
-            live = [i for i in range(n) if self.is_open(i) and i not in self._warming] or list(range(n))
+            live = [i for i in range(n) if self.is_open(i) and i not in self._warming
+                    and not self.outs[i].held] or list(range(n))
             G = np.zeros((n, len(az)), np.float32)
             G[live] = dsp.pan_gains([pos[i] for i in live], st.listener, az, st.focus)
             dist = dsp.distances(pos, st.listener)

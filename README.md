@@ -67,9 +67,10 @@ Windows; stereo sources are upmixed (optional).
   again, with its delay and position kept.
 - A returning speaker can end up slightly late: right after reconnecting its
   Bluetooth link is unsteady and the speaker may enlarge its own buffer. So
-  once it has played for 8 s, RoomCast closes just that speaker for 2 s and
-  brings it back on a now-steady link; the others keep playing (**Resync a
-  speaker after it comes back**, can be switched off). If speakers still
+  it reconnects silently, and after 8 s RoomCast closes just that speaker for
+  2 s and brings it back on a now-steady link. Only then does it play again,
+  so it doesn't cut in and out before it is in time; the others keep playing
+  (**Resync a speaker after it comes back**, can be switched off). If speakers still
   sound out of step, the **Resync** button next to Stop restarts all of them
   for about two seconds, the same as pressing Stop and Start.
 - Short pauses on one speaker (common when a phone is also connected to it,
@@ -168,10 +169,13 @@ Key design points:
   retried less often each time (10 s up to 2 min).
 - **Resync.** RoomCast's ring buffer puts a rejoined speaker exactly back on
   target, but it can't see lag added inside the Bluetooth link or the
-  speaker, which can leave that speaker late. A rejoined speaker that has
-  played steadily (`Engine.is_playing`) for `SETTLE_S` gets one reset of its
-  own (`MainWindow._reset_speaker`: `Engine.drop`, wait `RESET_GAP_MS`,
-  `Engine.rejoin`); that rejoin doesn't trigger another reset. The Resync
+  speaker, which can leave that speaker late. A rejoined speaker is held
+  silent (`Engine.hold`; in Surround its channels stay on the others) and,
+  once it has taken audio steadily (`Engine.is_playing`) for `SETTLE_S`, gets
+  one reset of its own (`MainWindow._reset_speaker`: `Engine.drop`, wait
+  `RESET_GAP_MS`, `Engine.rejoin`). The hold is lifted when that rejoin
+  succeeds, and it doesn't trigger another reset. Switching the option off
+  lifts any hold at once. The Resync
   button (`MainWindow._resync`) closes every stream, waits 1.5 s for Windows
   to close the Bluetooth audio links, then re-scans and starts again.
 - **Unrelated device changes don't interrupt playback.** Endpoints that come
