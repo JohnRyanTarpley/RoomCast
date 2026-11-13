@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 import numpy as np
@@ -46,6 +46,32 @@ class SpeakerCfg:
     hi: float = 20000.0
     color: str = COLORS[0]
     placed: bool = False
+
+    @classmethod
+    def from_dict(cls, name, d):
+        """From the settings file: unknown keys are ignored and invalid values
+        keep their defaults. None if `d` isn't a speaker entry at all."""
+        if not isinstance(d, dict):
+            return None
+        cfg = cls(name=name)
+        for f in fields(cls):
+            if f.name != "name" and f.name in d and same_kind(d[f.name], getattr(cfg, f.name)):
+                setattr(cfg, f.name, d[f.name])
+        return cfg
+
+
+def same_kind(value, default):
+    """True if a value read from the settings file has the same type as the
+    default it replaces (any number for a number; a list of fixed length, such
+    as a position, element by element; an empty default list takes any list)."""
+    if isinstance(default, bool):
+        return isinstance(value, bool)
+    if isinstance(default, (int, float)):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if isinstance(default, list) and default:
+        return (isinstance(value, list) and len(value) == len(default)
+                and all(same_kind(v, x) for v, x in zip(value, default)))
+    return isinstance(value, type(default))
 
 
 class MainWindow(DropoutHandling, QMainWindow):
@@ -110,25 +136,65 @@ class MainWindow(DropoutHandling, QMainWindow):
 
     # ---- persistence -------------------------------------------------
     def _load(self):
+        """Load the settings file. Anything missing or invalid keeps its default
+        and the rest still loads; a file that can't be read at all is kept
+        aside as settings.broken.json rather than overwritten."""
         try:
             d = json.loads(CONFIG.read_text("utf-8"))
-            self.speakers = {k: SpeakerCfg(**v) for k, v in d["speakers"].items()}
-            self.checked = d["checked"]
-            self.room, self.listener, self.mode = d["room"], d["listener"], d["mode"]
-            self.opts.update(d["opts"])
-            self.opts.pop("auto_resync", None)      # no longer optional: a returned speaker is always reset
-        except Exception:
-            pass
+            if not isinstance(d, dict):
+                raise ValueError("not a settings object")
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as e:
+            broken = CONFIG.with_name("settings.broken.json")
+            try:
+                os.replace(CONFIG, broken)
+            except OSError:
+                pass
+            log.info("settings: couldn't read %s (%s), kept it as %s and started with defaults",
+                     CONFIG.name, e, broken.name)
+            return
+        skipped = []
+
+        def take(key, default, valid=lambda v: True):
+            v = d.get(key, default)
+            if same_kind(v, default) and valid(v):
+                return v
+            skipped.append(key)
+            return default
+
+        for name, v in take("speakers", {}).items():
+            cfg = SpeakerCfg.from_dict(name, v)
+            if cfg is None:
+                skipped.append("speaker %s" % name)
+            else:
+                self.speakers[name] = cfg
+        self.checked = [n for n in take("checked", []) if isinstance(n, str)]
+        self.room = take("room", self.room, lambda r: all(x > 0 for x in r))
+        self.listener = take("listener", self.listener)
+        self.mode = take("mode", self.mode, lambda m: m in MODES)
+        for key, v in take("opts", {}).items():
+            if key == "layout" and isinstance(v, dict):
+                self.opts[key] = v
+            elif key in self.opts and same_kind(v, self.opts[key]):
+                self.opts[key] = v
+            elif key != "auto_resync":      # (no longer an option: a returned speaker is always reset)
+                skipped.append("option %s" % key)
+        if skipped:
+            log.info("settings: ignored invalid %s", ", ".join(skipped))
 
     def _save(self):
+        # Write a new file and swap it in, so a crash mid-save can't leave a half-written one.
+        tmp = CONFIG.with_name(CONFIG.name + ".tmp")
         try:
             CONFIG.parent.mkdir(parents=True, exist_ok=True)
-            CONFIG.write_text(json.dumps({
+            tmp.write_text(json.dumps({
                 "speakers": {k: asdict(v) for k, v in self.speakers.items()},
                 "checked": self.checked, "room": self.room, "listener": self.listener,
                 "mode": self.mode, "opts": self.opts}, indent=1), "utf-8")
-        except Exception:
-            pass
+            os.replace(tmp, CONFIG)
+        except (OSError, TypeError, ValueError) as e:
+            log.info("settings: couldn't save: %s", e)
 
     def closeEvent(self, e):
         self.monitor.stop()
@@ -221,11 +287,20 @@ class MainWindow(DropoutHandling, QMainWindow):
         self.src_combo = QComboBox()
         self.src_combo.currentIndexChanged.connect(self._on_source)
         v.addWidget(self.src_combo)
-        v.addWidget(hint("Choose the device Windows is set to play through. It must not be one "
-                         "of the ticked speakers, or the sound would feed back on itself."))
+        self.src_hint = hint("")              # says whether the chosen source works (see _update_source_hint)
+        self.src_hint.setTextFormat(Qt.RichText)
+        v.addWidget(self.src_hint)
+        row = QHBoxLayout()
+        self.src_fix = QPushButton("Play Windows sound through this")
+        self.src_fix.setToolTip("Make this device the Windows default output, so the music RoomCast "
+                                "records is the music your apps are playing.")
+        self.src_fix.clicked.connect(self._make_source_default)
+        self.src_fix.hide()
+        row.addWidget(self.src_fix)
         b = QPushButton("Windows sound settings…")
         b.clicked.connect(lambda: self._open_settings("ms-settings:sound"))
-        v.addWidget(b)
+        row.addWidget(b)
+        v.addLayout(row)
         left.addWidget(g)
 
         g = QGroupBox("3 · Mode")
@@ -534,18 +609,13 @@ class MainWindow(DropoutHandling, QMainWindow):
         for s in self.sources:
             self.src_combo.addItem("%s  (%d ch, %d Hz)" % (s["name"].replace(" [Loopback]", ""),
                                                            s["channels"], s["rate"]))
-        want = self.opts["source"]
-        names = [s["name"] for s in self.sources]
-        if want not in names and self.backend is not None:
-            default = self.backend.default_output_name()
-            want = next((n for n in names if default and n.startswith(default)), "")
-        if want in names:
-            self.src_combo.setCurrentIndex(names.index(want))
+        self._choose_source()
         self._loading = False
         self._rebuild_active()
         if resume:
             self._start(quiet=True)
         self._update_rows()
+        self._update_source_hint()
 
     def _add_new_rows(self):
         # Add a row for every listable speaker that doesn't have one yet.
@@ -561,9 +631,101 @@ class MainWindow(DropoutHandling, QMainWindow):
             self.dev_list.setItemWidget(it, row)
             self.rows[name] = row
 
+    # ---- audio source ------------------------------------------------
+    # The source is the loopback of an output device: whatever Windows plays
+    # through that device is what RoomCast records and sends to the speakers.
+    VIRTUAL_CABLE = ("vb-audio", "cable input")     # name fragments of virtual audio cables
+
+    def _source_name(self, s=None):
+        # The output device behind a source (the chosen one by default), as Windows names it.
+        if s is None:
+            i = self.src_combo.currentIndex()
+            s = self.sources[i] if 0 <= i < len(self.sources) else None
+        return s["name"].replace(" [Loopback]", "") if s else None
+
+    def _is_speaker(self, name):
+        # A ticked speaker or any Bluetooth speaker: the devices RoomCast plays to.
+        e = self.endpoints.get(name)
+        return name in self.checked or bool(e and e["bluetooth"])
+
+    def _windows_output(self):
+        # The device Windows currently plays through (its name), or None if unknown.
+        if bt is not None:
+            try:
+                d = bt.default_output()
+                return d["name"] if d else None
+            except OSError:
+                pass
+        return self.backend.default_output_name() if self.backend is not None else None
+
+    def _auto_source(self):
+        """A sensible source when the user hasn't chosen one: the device Windows
+        plays through, unless that is a speaker; then a virtual cable; then a
+        wired output. Never a Bluetooth or ticked speaker. None if no such device."""
+        usable = [s for s in self.sources if not self._is_speaker(self._source_name(s))]
+        default = self._windows_output()
+        for s in usable:
+            if default and self._source_name(s) == default:
+                return s
+        for s in usable:
+            if any(v in s["name"].lower() for v in self.VIRTUAL_CABLE):
+                return s
+        return usable[0] if usable else None
+
+    def _choose_source(self):
+        # Select the saved source, or pick one automatically if none was chosen or it's gone.
+        names = [s["name"] for s in self.sources]
+        want = self.opts["source"]
+        if want not in names:
+            auto = self._auto_source()
+            want = auto["name"] if auto else ""
+        if want in names:
+            self.src_combo.setCurrentIndex(names.index(want))
+
+    def _update_source_hint(self):
+        """Say whether the chosen source works: it must not be a speaker, and
+        Windows must be playing through it."""
+        src = self._source_name()
+        default = self._windows_output()
+        fix = False
+        if src is None:
+            color, text = RED, "No source devices found. Press Refresh."
+        elif src in self.checked:
+            color, text = RED, ("This is one of your ticked speakers, so the sound would feed back on "
+                                "itself. Choose a device you aren't using as a speaker.")
+        elif self._is_speaker(src):
+            color, text = AMBER, ("This is a Bluetooth speaker, so your music would also play on it "
+                                  "directly. A wired output or a virtual cable works better.")
+        elif default and default != src:
+            e = self.endpoints.get(src)
+            fix = bool(e and e["connected"])
+            color, text = AMBER, ("Windows is playing through %s, not this device, so RoomCast won't "
+                                  "hear your music." % default)
+        elif any(v in src.lower() for v in self.VIRTUAL_CABLE):
+            color, text = GREEN, ("Windows plays through this virtual cable and RoomCast records it. "
+                                  "Nothing else plays out loud.")
+        else:
+            color, text = GREEN, ("Windows plays through this device and RoomCast records it. Turn this "
+                                  "device's volume all the way down so you only hear the speakers.")
+        self.src_hint.setText("<span style='color:%s'>●</span> %s" % (color, text))
+        self.src_fix.setVisible(fix)
+
+    def _make_source_default(self):
+        src = self._source_name()
+        e = self.endpoints.get(src) if src else None
+        if bt is None or e is None:
+            return
+        try:
+            bt.set_default_output(e["id"])
+        except OSError as err:
+            self._flash("Windows didn't switch to %s (%s). Use Windows sound settings instead."
+                        % (src, err), 10)
+        self._update_source_hint()
+
     def _on_source(self, i):
         if not self._loading and 0 <= i < len(self.sources):
-            self.opts["source"] = self.sources[i]["name"]
+            self.opts["source"] = self.sources[i]["name"]     # chosen by the user: kept from now on
+            self._update_source_hint()
             self._restart_if_running()
 
     def _on_toggle(self, name, on):
@@ -573,6 +735,11 @@ class MainWindow(DropoutHandling, QMainWindow):
             self.checked.append(name)
         elif not on and name in self.checked:
             self.checked.remove(name)
+        if not self.opts["source"] and self._source_name() in self.checked:
+            self._loading = True        # the automatic choice just became a speaker: choose again
+            self._choose_source()
+            self._loading = False
+        self._update_source_hint()
         self._link(name).drop = None
         if self.start_btn.isChecked():
             self._schedule_restart(150)     # also picks up speakers connected since the last refresh
