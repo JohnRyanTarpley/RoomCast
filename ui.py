@@ -293,7 +293,7 @@ class MainWindow(QMainWindow):
         self.mode = "sync"
         self.opts = {"master": 0.8, "base_ms": 40, "focus": 2.0, "delay_comp": True,
                      "level_comp": True, "upmix": True, "source": "", "auto_reconnect": True,
-                     "auto_resync": True, "keep_playing": True,
+                     "keep_playing": True,
                      "resync_on_pause": True}
         self.outputs, self.sources = [], []
         self._loading = False
@@ -359,6 +359,7 @@ class MainWindow(QMainWindow):
             self.checked = d["checked"]
             self.room, self.listener, self.mode = d["room"], d["listener"], d["mode"]
             self.opts.update(d["opts"])
+            self.opts.pop("auto_resync", None)      # no longer optional: a returned speaker is always reset
         except Exception:
             pass
 
@@ -506,15 +507,6 @@ class MainWindow(QMainWindow):
         row.addWidget(self.base)
         row.addStretch()
         v.addLayout(row)
-        cb = QCheckBox("Resync a speaker after it comes back")
-        cb.setToolTip("A speaker that returns after dropping out can end up slightly late. With this "
-                      "on, it reconnects silently; after %d s RoomCast closes just that speaker for "
-                      "%d s and brings it back in time, and only then does it play again. The others "
-                      "keep playing. If it is still out of step, press Resync."
-                      % (self.SETTLE_S, self.RESET_GAP_MS // 1000))
-        cb.setChecked(bool(self.opts["auto_resync"]))
-        cb.toggled.connect(lambda on: self.opts.__setitem__("auto_resync", on))
-        v.addWidget(cb)
         cb = QCheckBox("Keep the music playing when a speaker is switched off")
         cb.setToolTip("Many Bluetooth speakers tell the PC to pause as they switch off, which pauses "
                       "your music on every speaker. With this on, when your music pauses RoomCast "
@@ -1342,10 +1334,9 @@ class MainWindow(QMainWindow):
                     # Back from a dropout: keep it silent until it has settled and had
                     # its own reset, so it doesn't play late and then cut out again.
                     # Back from that reset: let it play.
-                    hold = not was_reset and self.opts["auto_resync"]
-                    if hold:
+                    if not was_reset:
                         self.resync_after[name] = None
-                    self.engine.hold(i, hold)
+                    self.engine.hold(i, not was_reset)
                     continue
                 fails = self.rejoin_fails[name] = self.rejoin_fails.get(name, 0) + 1
                 gone = self.dropped.get(name, {}).get("gone", False)
@@ -1368,10 +1359,8 @@ class MainWindow(QMainWindow):
             # link was still unsteady. The others keep playing.
             for name, t in list(self.resync_after.items()):
                 i = self.engine.index_of(name)
-                if i is None or not self.engine.is_open(i) or not self.opts["auto_resync"]:
-                    del self.resync_after[name]         # dropped again, or switched off
-                    if i is not None and self.engine.is_open(i):
-                        self.engine.hold(i, False)      # switched off: play it as it is
+                if i is None or not self.engine.is_open(i):
+                    del self.resync_after[name]         # dropped again
                     self._update_rows()
                 elif not self.engine.is_playing(i):
                     self.resync_after[name] = None
@@ -1562,9 +1551,11 @@ class MainWindow(QMainWindow):
             return "Turned off. Its sound moved to the other speakers.", AMBER, False, True
         playing = self.engine.running and any(o.name == name for o in self.engine.outs)
         if name not in self.dropped and name in self.checked and self.start_btn.isChecked() and (
-                self._resyncing or (self._checking and playing)):
-            # All speakers restarting (or, after a pause, being checked for one
-            # that was switched off): don't flash "Joining…" / "Playing" meanwhile.
+                self._resyncing or (self._checking and playing and self.opts["resync_on_pause"])):
+            # All speakers restarting (or, after a pause that resynced them, still
+            # being checked for one that was switched off): don't flash "Joining…" /
+            # "Playing" meanwhile. Without the resync, nothing restarts on a pause,
+            # so the speakers just keep saying "Playing" during the check.
             return "Resyncing…", AMBER, False, True
         if name in self.resync_after and name not in self.dropped:
             return "Back. Stabilizing connection…", AMBER, False, True
