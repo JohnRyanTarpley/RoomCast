@@ -33,7 +33,8 @@ from diag import log
 
 
 class PauseGuard(QObject):
-    kept_playing = Signal()             # a speaker went away, so a pause was undone
+    paused = Signal()                   # the music paused (no app is playing any more)
+    checking = Signal(bool)             # a check of the speakers started (True) / ended (False)
     switched_off = Signal(str)          # ... and this is the one (when it could be told)
 
     FIRST_CHECK_S = 1.0     # a speaker can still answer just after sending its pause
@@ -49,6 +50,8 @@ class PauseGuard(QObject):
         self._busy = False              # a check is running
         self._hung = 0                  # queries that didn't answer in time and are still running
         self.available = self._check_available()
+        self._loop = None               # the guard thread's event loop, once running
+        self._mgr = None                # media session manager, once running
 
     @staticmethod
     def _check_available():
@@ -82,6 +85,7 @@ class PauseGuard(QObject):
         except Exception as e:
             log.info("pause guard: media sessions unavailable: %s", e)
             return
+        self._loop, self._mgr = asyncio.get_running_loop(), mgr
         playing = {}                    # app id -> was playing at the last look
         paused_at = {}                  # app id -> (time it paused, session)
         while True:
@@ -107,6 +111,8 @@ class PauseGuard(QObject):
                 playing[app] = is_playing
             for app in [a for a, (t, _) in paused_at.items() if now - t > self.RESUME_WITHIN_S]:
                 del paused_at[app]
+            if fresh and not any(playing.values()):
+                self.paused.emit()
             if fresh and self.enabled and not self._busy and not self._hung:
                 with self._lock:
                     speakers = dict(self._speakers)
@@ -115,7 +121,29 @@ class PauseGuard(QObject):
                     self._busy = True
                     asyncio.ensure_future(self._check(speakers, paused_at))
 
+    def pause_all(self):
+        """Pause every app that is playing media (used when RoomCast is
+        stopped). Safe to call from any thread; does nothing if unavailable."""
+        if self._loop is not None:
+            asyncio.run_coroutine_threadsafe(self._pause_all(), self._loop)
+
+    async def _pause_all(self):
+        from winrt.windows.media.control import (
+            GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status)
+        try:
+            sessions = list(self._mgr.get_sessions())
+        except Exception:
+            return
+        for s in sessions:
+            try:
+                if s.get_playback_info().playback_status == Status.PLAYING:
+                    await s.try_pause_async()
+                    log.info("paused %s because RoomCast was stopped", s.source_app_user_model_id)
+            except Exception as e:
+                log.info("couldn't pause a media app: %s", e)
+
     async def _check(self, speakers, paused_at):
+        self.checking.emit(True)
         try:
             t0 = time.monotonic()
             stuck, gone, last_ok = False, None, {}
@@ -146,7 +174,6 @@ class PauseGuard(QObject):
                          "can't tell which yet")
             if len(speakers) < 2:
                 return                              # nothing left to play on
-            self.kept_playing.emit()
             if gone:
                 asyncio.ensure_future(self._watch_recovery(
                     {n: a for n, a in speakers.items() if n != gone}, t0))
@@ -159,6 +186,7 @@ class PauseGuard(QObject):
             paused_at.clear()
         finally:
             self._busy = False
+            self.checking.emit(False)
 
     async def _watch_recovery(self, speakers, t0):
         """For the log: after the switched-off speaker was taken out, how soon

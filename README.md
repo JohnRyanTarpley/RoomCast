@@ -59,42 +59,30 @@ Windows). Put a `RoomCast.ico` in `launcher/` before building to give it an icon
 True 5.1/7.1 input is used when the source device is configured for it in
 Windows; stereo sources are upmixed (optional).
 
-**Connection problems are handled for you:**
+**When a speaker drops out or is turned off:**
 
-- If a speaker drops out while playing, the others keep going without a
-  break. In Surround mode its channels fade over to them, and fade back once
-  it is playing again. The speaker rejoins automatically when Windows sees it
-  again, with its delay and position kept.
-- A returning speaker can end up slightly late: right after reconnecting its
-  Bluetooth link is unsteady and the speaker may enlarge its own buffer. So
-  it reconnects silently, and after 3.5 s RoomCast closes just that speaker for
-  2 s and brings it back on a now-steady link. Only then does it play again,
-  so it doesn't cut in and out before it is in time; the others keep playing
-  (**Resync a speaker after it comes back**, can be switched off). If speakers still
-  sound out of step, the **Resync** button next to Stop restarts all of them
-  for about two seconds, the same as pressing Stop and Start.
-- Many Bluetooth speakers tell the PC to pause as they switch off, which
-  would pause your music on every speaker. When your music pauses, RoomCast
-  checks whether a speaker has just gone. If one has, the music plays on
-  after a few seconds (**Keep the music playing when a speaker is switched
-  off**, can be switched off). Pausing on purpose, from a speaker's button or
-  the PC, still pauses. Some speakers switch off without telling Windows, and
-  Windows takes about 20 s to notice; until then the remaining speakers can
-  stutter, and in Surround the missing speaker's channels move over once
-  Windows has noticed.
-- Short pauses on one speaker (common when a phone is also connected to it,
-  even if the phone isn't playing anything) are ridden out without resyncing
-  or restarting anything. For the most reliable playback, disconnect phones
-  from the speakers RoomCast uses.
-- While playing, RoomCast asks Windows to reconnect ticked speakers that have
-  disconnected, every 30 seconds (can be switched off).
-- Speakers with a microphone show up in Windows twice; RoomCast hides the
-  low-quality "Hands-Free" (phone call) output and warns when a speaker is
-  stuck in that mode.
+- The other speakers keep playing. In Surround mode, its channels move over
+  to them.
+- If turning a speaker off pauses your music, RoomCast starts it again on
+  the remaining speakers within a few seconds. Pausing on purpose still
+  pauses.
+- When the speaker comes back, it rejoins by itself with its delay and
+  position kept, and stays silent until it is in time with the others.
+- RoomCast reconnects ticked speakers that have disconnected.
+- All speakers are resynced whenever the music pauses. If they still sound
+  out of step, press **Resync**.
+- Pressing **Stop** also pauses the music on your PC.
 
-Many built-in Bluetooth adapters struggle with more than 2–3 speakers playing
-at once, and Windows uses only one adapter at a time. A good USB Bluetooth
-5.x adapter helps if speakers keep dropping out.
+Most of these can be switched off with the checkboxes in RoomCast.
+
+**Tips:**
+
+- Disconnect phones from the speakers RoomCast uses. A connected phone, even
+  an idle one, causes short dropouts.
+- Built-in Bluetooth adapters often struggle with more than 2–3 speakers. A
+  good USB Bluetooth 5.x adapter helps if speakers keep dropping out.
+- Speakers with a microphone show up twice in Windows. RoomCast hides the
+  low-quality "Hands-Free" output and warns if a speaker is stuck in it.
 
 ### Video and lip-sync
 
@@ -143,6 +131,8 @@ delay. Workarounds:
 | `backend.py` | WASAPI device listing, loopback capture and output streams (PyAudioWPatch). |
 | `bluetooth.py` | Windows device APIs: endpoint state incl. disconnected paired speakers and hands-free detection (Core Audio via ctypes), one-shot Bluetooth reconnect (`IKsControl`), battery level (`cfgmgr32`), scanning and pairing (WinRT via `winrt-*`). No drivers or admin rights. |
 | `connection.py` | `DeviceMonitor` (background polling: state every 2 s, battery every 30 s; runs reconnects off the GUI thread) and the pairing dialog. |
+| `pauseguard.py` | Watches media apps: resumes the music when a speaker switching off paused it, triggers the resync on pause, and pauses the music when RoomCast is stopped. |
+| `diag.py` | Diagnostic log of connection events. |
 
 Key design points:
 
@@ -176,33 +166,25 @@ Key design points:
   twice does the window restart playback to re-scan devices (at most once
   every 5 minutes per speaker); otherwise a speaker that keeps failing is
   retried less often each time (10 s up to 2 min).
-- **Resync.** RoomCast's ring buffer puts a rejoined speaker exactly back on
-  target, but it can't see lag added inside the Bluetooth link or the
-  speaker, which can leave that speaker late. A rejoined speaker is held
-  silent (`Engine.hold`; in Surround its channels stay on the others) and,
-  once it has taken audio steadily (`Engine.is_playing`) for `SETTLE_S`, gets
-  one reset of its own (`MainWindow._reset_speaker`: `Engine.drop`, wait
-  `RESET_GAP_MS`, `Engine.rejoin`). The hold is lifted when that rejoin
-  succeeds, and it doesn't trigger another reset. Switching the option off
-  lifts any hold at once. The Resync
-  button (`MainWindow._resync`) closes every stream, waits 1.5 s for Windows
-  to close the Bluetooth audio links, then re-scans and starts again.
-- **Switched-off speakers (`pauseguard.py`).** A speaker's AVRCP pause reaches
-  the media app straight from Windows (no input event to intercept), and
-  Windows only marks a speaker that switched off without disconnecting
-  cleanly as gone after its ~20 s link timeout. `PauseGuard` watches the media
-  sessions; when one goes from playing to paused it asks the playing speakers
-  an uncached SDP query (`get_rfcomm_services_async`) at 1.5 s and 3.5 s, one
-  at a time. While Windows is still trying to reach a switched-off speaker,
-  every speaker's query hangs, so a query that doesn't answer within 2 s means
-  some speaker has gone but not which: the paused sessions are resumed
-  (`try_play_async`) and the speaker is dropped as usual once Windows marks it
-  disconnected. If every speaker answers, the pause stands. `Engine.drop`
-  closes streams on a background thread, since closing one while the
-  Bluetooth stack is stuck can block for half a minute. Addresses come from the `BTHENUM\Dev_<address>` device
-  node with the endpoint's container id (`bluetooth.bluetooth_addresses`).
+- **Resync.** A rejoined speaker can be late from lag inside its Bluetooth
+  link, which the ring buffer can't see. So it is held silent
+  (`Engine.hold`) until it has played steadily for `SETTLE_S`, then reset
+  once on its own (`MainWindow._reset_speaker`). The Resync button and every
+  music pause (`PauseGuard.paused`) restart all speakers
+  (`MainWindow._resync`).
+- **Switched-off speakers (`pauseguard.py`).** Many speakers send a pause
+  (AVRCP) as they switch off, and Windows only notices the speaker is gone
+  after a ~20 s link timeout, during which Bluetooth to the other speakers
+  stalls too. On a pause, `PauseGuard` sends each speaker a live Bluetooth
+  query, one at a time. If every speaker answers, the pause was meant. If one
+  answers and the next hangs, the one that hung is dropped at once. Either
+  way the music is resumed, and the restart on pause frees the other
+  speakers within about 4 s.
+- **Nothing blocks the window.** Opening and closing streams run on
+  background threads (`Engine.start`, `Engine.stop`, `Engine.drop`), since
+  they can hang for many seconds while Bluetooth is stalled.
 - **Diagnostic log.** Connection events go to `%APPDATA%\RoomCast\roomcast.log`
-  (`diag.py`, 500 kB, one backup).
+  (`diag.py`).
 - **Unrelated device changes don't interrupt playback.** Endpoints that come
   and go without affecting playback (another speaker, a hands-free endpoint
   flickering because a phone connected to a speaker) just update the list.

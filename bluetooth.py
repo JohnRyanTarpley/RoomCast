@@ -76,7 +76,7 @@ BT_ENUMERATORS = ("BTHENUM", "BTHHFENUM", "BTHLEDEVICE", "BTHLE")
 
 
 def _vcall(obj, index, argtypes, *args):
-    """Call method number `index` of the COM object pointer `obj`."""
+    # Call method number `index` of the COM object pointer `obj`.
     fn_addr = ctypes.cast(obj, POINTER(POINTER(c_void_p)))[0][index]
     fn = ctypes.WINFUNCTYPE(HRESULT, c_void_p, *argtypes)(fn_addr)
     return fn(obj, *args)
@@ -420,7 +420,7 @@ async def scan_for_speakers(seconds, on_found, should_stop=lambda: False):
 
 
 async def pair(device_id):
-    """Pair with a speaker found by scan_for_speakers. Returns (ok, message)."""
+    # Pair with a speaker found by scan_for_speakers. Returns (ok, message).
     from winrt.windows.devices.enumeration import (DeviceInformation, DeviceInformationKind,
                                                    DevicePairingKinds, DevicePairingResultStatus)
 

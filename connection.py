@@ -1,4 +1,4 @@
-"""Background device monitoring and the "Add speaker" pairing dialog."""
+# Background device monitoring and the "Add speaker" pairing dialog.
 from __future__ import annotations
 
 import asyncio
@@ -136,7 +136,7 @@ class _PairWorker(QObject):
 
 
 class PairDialog(QDialog):
-    """Finds nearby Bluetooth speakers that are in pairing mode and pairs them."""
+    # Finds nearby Bluetooth speakers that are in pairing mode and pairs them.
 
     paired = Signal()
     SCAN_S = 20

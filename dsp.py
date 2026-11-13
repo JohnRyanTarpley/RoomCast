@@ -1,4 +1,4 @@
-"""Signal-processing helpers: surround panning, downmixing, band filters."""
+# Signal-processing helpers: surround panning, downmixing, band filters.
 from __future__ import annotations
 
 import numpy as np
@@ -64,7 +64,7 @@ def distances(positions, listener) -> np.ndarray:
 
 
 def downmix(n_in: int) -> np.ndarray:
-    """Stereo downmix matrix (2 x n_in)."""
+    # Stereo downmix matrix (2 x n_in).
     if n_in == 1:
         D = [[1.0], [1.0]]
     elif n_in == 2:
@@ -83,7 +83,7 @@ def downmix(n_in: int) -> np.ndarray:
 
 
 class BandFilter:
-    """Stateful 4th-order Butterworth band filter for stereo blocks."""
+    # Stateful 4th-order Butterworth band filter for stereo blocks.
 
     def __init__(self, lo: float, hi: float, fs: float):
         self.key = (lo, hi)
