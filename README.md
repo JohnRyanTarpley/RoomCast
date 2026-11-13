@@ -85,20 +85,28 @@ Most of these can be switched off with the checkboxes in RoomCast.
 
 ### Video and lip-sync
 
-Expect roughly a quarter to half a second between the PC and the speakers:
-the **Safety buffer** (120 ms by default, can be set as low as 0 ms if your
-speakers play without dropouts) plus each speaker's own Bluetooth lag, which
-RoomCast can't change. That is fine for music. For video it is not a
+Expect roughly 0.2 to 0.4 s between the PC and the speakers. Most of that is
+each speaker's own Bluetooth lag (typically 100 to 300 ms), which RoomCast
+can't change. RoomCast adds:
+
+- the **Safety buffer**: 40 ms by default. It can be set as low as 0 ms if
+  your speakers play without dropouts, though about 15 ms is always kept;
+- about 10 ms each for capturing the audio and sending it to the speaker;
+- any **Delay** you set on a speaker, plus distance compensation in Surround
+  mode. These line the speakers up with the slowest one, so the speaker that
+  needs the least delay gets none.
+
+That is fine for music. For video it is not a
 Bluetooth limit as such: when you play to a single Bluetooth speaker, Windows
 tells the video player about the lag and the player holds the picture back.
 Here the player only sees the source device, so it doesn't know about the
 delay. Workarounds:
 
 - **VLC:** Tools > Track Synchronization, set the audio track
-  synchronization to a negative value (start at -0.350 s), or press **J** to
+  synchronization to a negative value (start at -0.300 s), or press **J** to
   adjust while watching. To keep it, set **Audio desynchronization
   compensation** (Tools > Preferences > All > Audio) to the same value in ms.
-- **mpv:** add `audio-delay=-0.35` to `mpv.conf`, or adjust with
+- **mpv:** add `audio-delay=-0.3` to `mpv.conf`, or adjust with
   **Ctrl + −** / **Ctrl + +**. With yt-dlp installed, mpv also plays YouTube
   links directly (`mpv <link>`), with the offset applied.
 - **MPC-HC:** Options > Internal Filters > Audio Switcher > time shift.
@@ -140,7 +148,9 @@ Key design points:
   against a target and nudges its resampling ratio (at most ±0.5 %) to hold
   it there, so speakers neither drift apart nor run dry.
 - **Delay = buffer target.** A speaker's delay is simply its target fill:
-  safety buffer + distance compensation + manual delay. Small errors glide.
+  safety buffer + distance compensation + manual delay, with the smallest
+  compensation + delay across speakers subtracted so the earliest speaker
+  waits only for the safety buffer. Small errors glide.
   A speaker is jumped back into line only when it has been more than 40 ms
   off for over half a second, or when its delay setting changes, because
   Bluetooth links often pause and then catch up by themselves.

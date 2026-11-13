@@ -291,7 +291,7 @@ class MainWindow(QMainWindow):
         self.room = [5.0, 4.0, 2.5]
         self.listener = [0.0, 0.0, 1.2]
         self.mode = "sync"
-        self.opts = {"master": 0.8, "base_ms": 120, "focus": 2.0, "delay_comp": True,
+        self.opts = {"master": 0.8, "base_ms": 40, "focus": 2.0, "delay_comp": True,
                      "level_comp": True, "upmix": True, "source": "", "auto_reconnect": True,
                      "auto_resync": True, "keep_playing": True,
                      "resync_on_pause": True}

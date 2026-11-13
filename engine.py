@@ -26,7 +26,7 @@ class SpeakerSettings:
 class MixSettings:
     mode: str = "sync"              # "surround" | "frequency" | "sync"
     master: float = 1.0
-    base_ms: float = 100.0
+    base_ms: float = 60.0
     listener: tuple = (0.0, 0.0, 1.2)
     focus: float = 2.0
     delay_comp: bool = True
