@@ -1,5 +1,6 @@
 # Virtual environment (created by "Run RoomCast.bat" on first run)
 .venv/
+runtime/
 venv/
 env/
 
@@ -11,6 +12,7 @@ __pycache__/
 # Packaging / build output (e.g. PyInstaller, setuptools)
 build/
 dist/
+tools/
 *.spec
 *.egg-info/
 .eggs/

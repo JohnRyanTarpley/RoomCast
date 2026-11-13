@@ -1,4 +1,4 @@
-# RoomCast v0.9.7
+# RoomCast
 RoomCast is a 3D spatial audio software for connecting multiple Bluetooth speakers to one device to enable surround sound functionality.
 
 ![RoomCast playing on four Bluetooth speakers in Surround mode](assets/preview.png)
@@ -14,15 +14,30 @@ speakers at once, in one of three modes:
 
 ## Running it
 
-1. Install Python 3.10 or newer from python.org (tick "Add python.exe to PATH").
-2. Double-click **RoomCast.exe** (or **Run RoomCast.bat**, which does the same
-   thing). The first run creates a private `.venv` folder and downloads the
-   packages in `requirements.txt`; later runs start immediately, with no
-   console window.
+RoomCast runs on Windows 10 and 11. You don't need to install anything first.
+
+1. Download `RoomCast-<version>.zip` from the
+   [latest release](https://github.com/JohnRyanTarpley/RoomCast/releases/latest)
+   and extract it anywhere, for example into your Documents folder.
+2. Double-click **RoomCast.exe** in the extracted `RoomCast` folder (or
+   **Run RoomCast.bat**, which does the same thing).
+
+The first run sets RoomCast up, which takes a few minutes and needs an internet
+connection; a window shows the progress. If Python 3.10 or newer (64-bit) is
+already installed, RoomCast uses it, and any of its packages that Python
+already has are reused instead of downloaded again. Otherwise RoomCast
+downloads its own copy of Python from python.org into its folder. Either way
+nothing is installed system-wide and no admin rights are needed. Later runs
+start immediately, with no console window.
+
+The first time you run it, Windows may show "Windows protected your PC",
+because `RoomCast.exe` isn't digitally signed. Click **More info**, then
+**Run anyway**.
 
 `RoomCast.exe` is a small launcher that runs `Run RoomCast.bat`. It must stay in
 the RoomCast folder. Only one RoomCast runs at a time: starting it again brings
-the open window to the front.
+the open window to the front. Your settings are kept in `%APPDATA%\RoomCast`,
+so they carry over when you replace the folder with a newer release.
 
 ## Using it
 
@@ -231,5 +246,14 @@ Key design points:
 - **Unrelated device changes don't interrupt playback.** Endpoints that come
   and go without affecting playback (another speaker, a hands-free endpoint
   flickering because a phone connected to a speaker) just update the list.
-- **Packages.** `Run RoomCast.bat` reinstalls packages whenever
-  `requirements.txt` changes (it keeps a copy in `.venv\requirements.installed`).
+- **Setup (`Run RoomCast.bat`).** RoomCast runs on a Python of its own. If an
+  installed Python 3.10+ (64-bit) is found, a private `.venv` is made from it
+  with `--system-site-packages`, so packages it already has are reused. If
+  there is none, or installing the packages into it fails (for example a
+  Python too new for one of them), the official embeddable Python (pinned
+  version, SHA-256 checked) is downloaded into `runtime\`, its `._pth` file
+  is edited to enable site-packages and add the RoomCast folder, and pip is
+  bootstrapped with `get-pip.py`. Packages are installed on first run and
+  again whenever `requirements.txt` changes (a copy is kept as
+  `requirements.installed` in `.venv` or `runtime`); pip skips those already
+  present. `RoomCast.exe` shows the setup window only while this happens.

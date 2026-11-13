@@ -1,4 +1,4 @@
-PySide6>=6.5
+PySide6-Essentials>=6.5    # Qt Core, Gui, Widgets, Network, Svg: all RoomCast uses (full PySide6 adds ~440 MB of unused add-ons)
 numpy>=1.24
 scipy>=1.10
 PyAudioWPatch>=0.2.12.6
