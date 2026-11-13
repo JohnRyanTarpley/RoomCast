@@ -1,5 +1,6 @@
 # Virtual environment (created by "Run RoomCast.bat" on first run)
 .venv/
+runtime/
 venv/
 env/
 

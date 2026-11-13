@@ -53,14 +53,18 @@ static class Program
         return 0;
     }
 
-    // Mirrors the batch file's check: packages are (re)installed on first run and
-    // whenever requirements.txt differs from the copy saved after the last install.
+    // Mirrors the batch file's check: Python and the packages are set up on first run
+    // (in "runtime" or ".venv"), and packages are reinstalled whenever requirements.txt
+    // differs from the copy saved after the last install.
     static bool NeedsInstall(string root)
     {
         try
         {
-            if (!File.Exists(Path.Combine(root, @".venv\Scripts\python.exe"))) return true;
-            string installed = Path.Combine(root, @".venv\requirements.installed");
+            string env;
+            if (File.Exists(Path.Combine(root, @"runtime\python.exe"))) env = "runtime";
+            else if (File.Exists(Path.Combine(root, @".venv\Scripts\python.exe"))) env = ".venv";
+            else return true;
+            string installed = Path.Combine(root, env, "requirements.installed");
             if (!File.Exists(installed)) return true;
             byte[] a = File.ReadAllBytes(Path.Combine(root, "requirements.txt"));
             byte[] b = File.ReadAllBytes(installed);
