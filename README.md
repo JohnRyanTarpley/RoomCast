@@ -72,7 +72,9 @@ Windows; stereo sources are upmixed (optional).
   and carries on where it left off.
 - Pressing **Stop** also pauses the music on your PC.
 
-Most of these can be switched off with the checkboxes in RoomCast.
+Restarting the music after a speaker is switched off, auto-reconnecting and
+resyncing on every pause can each be switched off with the checkboxes in
+RoomCast.
 
 **Tips:**
 
@@ -131,7 +133,9 @@ delay. Workarounds:
 | File | Role |
 | --- | --- |
 | `main.py` | Entry point. |
-| `ui.py` | Main window: device list, mode pages, per-speaker table, settings persistence (`%APPDATA%\RoomCast\settings.json`). |
+| `ui.py` | Main window: device list, mode pages, per-speaker table, start/stop/resync, settings persistence (`%APPDATA%\RoomCast\settings.json`). |
+| `dropouts.py` | Speakers leaving and returning: `Link`, each speaker's connection record, and the main window's dropout, rejoin and Reconnect/Disconnect handling. |
+| `widgets.py` | Dark theme and reusable widgets (speaker list row, frequency band view, wrapping layout). |
 | `room_view.py` | Orbitable 3D room editor drawn with QPainter (no OpenGL needed). |
 | `engine.py` | Real-time routing. `Engine` turns each captured block into one signal per speaker; `SpeakerOut` holds it in a ring buffer and feeds that speaker's device callback. |
 | `dsp.py` | Channel layouts, stereo upmix, direction-based panning, downmix, Butterworth band filters. |
@@ -178,17 +182,17 @@ Key design points:
 - **Resync.** A rejoined speaker can be late from lag inside its Bluetooth
   link, which the ring buffer can't see. So it is held silent
   (`Engine.hold`) until it has played steadily for `SETTLE_S`, then reset
-  once on its own (`MainWindow._reset_speaker`). The Resync button and every
-  music pause (`PauseGuard.paused`) restart all speakers
-  (`MainWindow._resync`).
+  once on its own (`DropoutHandling._reset_speaker`). The Resync button and,
+  unless switched off, every music pause (`PauseGuard.paused`) restart all
+  speakers (`MainWindow._resync`).
 - **Switched-off speakers (`pauseguard.py`).** Many speakers send a pause
   (AVRCP) as they switch off, and Windows only notices the speaker is gone
   after a ~20 s link timeout, during which Bluetooth to the other speakers
   stalls too. On a pause, `PauseGuard` sends each speaker a live Bluetooth
   query, one at a time. If every speaker answers, the pause was meant. If one
   answers and the next hangs, the one that hung is dropped at once. Either
-  way the music is resumed, and the restart on pause frees the other
-  speakers within about 4 s.
+  way the music is resumed, and the restart on pause (when on) frees the
+  other speakers within about 4 s.
 - **Nothing blocks the window.** Opening and closing streams run on
   background threads (`Engine.start`, `Engine.stop`, `Engine.drop`), since
   they can hang for many seconds while Bluetooth is stalled.

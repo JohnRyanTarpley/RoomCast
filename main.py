@@ -6,7 +6,8 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 import diag
-from ui import MainWindow, apply_theme
+from ui import MainWindow
+from widgets import apply_theme
 
 
 def main():
