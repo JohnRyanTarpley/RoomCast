@@ -1,4 +1,4 @@
-"""RoomCast main window."""
+# RoomCast main window.
 from __future__ import annotations
 
 import json
@@ -20,12 +20,19 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComb
 
 import dsp
 from connection import DeviceMonitor, PairDialog, bt
+from diag import log
+from pauseguard import PauseGuard
 from engine import TONE_TOTAL_S, Engine, MixSettings, SpeakerSettings, open_tone_stream
 from room_view import LISTENER, RoomView
 
 COLORS = ["#ff6b6b", "#4dabf7", "#51cf66", "#fcc419", "#cc5de8", "#ff922b", "#22b8cf", "#f783ac"]
 MODES = ["surround", "frequency", "sync"]
 CONFIG = Path(os.environ.get("APPDATA", Path.home())) / "RoomCast" / "settings.json"
+try:                                    # same file the launcher's build stamps into RoomCast.exe
+    VERSION = (Path(__file__).parent / "VERSION").read_text("utf-8").strip()
+except OSError:
+    VERSION = ""
+STOPPED = "Stopped" + (" · RoomCast %s" % VERSION if VERSION else "")
 
 
 @dataclass
@@ -86,7 +93,7 @@ GREEN, AMBER, RED, GREY = "#51cf66", "#fcc419", "#ff6b6b", "#8b94a3"
 
 
 class ElidedCheckBox(QCheckBox):
-    """Check box whose label shortens with "…" to fit, so its column can be resized freely."""
+    # Check box whose label shortens with "…" to fit, so its column can be resized freely.
 
     def __init__(self, text):
         super().__init__(text)
@@ -102,7 +109,7 @@ class ElidedCheckBox(QCheckBox):
 
 
 def hbox():
-    """A horizontal row packed into its own widget: returns (widget, layout)."""
+    # A horizontal row packed into its own widget: returns (widget, layout).
     w = QWidget()
     lay = QHBoxLayout(w)
     lay.setContentsMargins(0, 0, 0, 0)
@@ -110,7 +117,7 @@ def hbox():
 
 
 class FlowLayout(QLayout):
-    """Lays widgets out left to right and wraps onto a new line when out of room."""
+    # Lays widgets out left to right and wraps onto a new line when out of room.
 
     def __init__(self, parent=None, hspace=14, vspace=6):
         super().__init__(parent)
@@ -239,7 +246,7 @@ class SpeakerRow(QWidget):
 
 
 class BandView(QWidget):
-    """Shows which slice of the spectrum each speaker plays."""
+    # Shows which slice of the spectrum each speaker plays.
 
     def __init__(self, state):
         super().__init__()
@@ -285,7 +292,9 @@ class MainWindow(QMainWindow):
         self.listener = [0.0, 0.0, 1.2]
         self.mode = "sync"
         self.opts = {"master": 0.8, "base_ms": 120, "focus": 2.0, "delay_comp": True,
-                     "level_comp": True, "upmix": True, "source": "", "auto_reconnect": True}
+                     "level_comp": True, "upmix": True, "source": "", "auto_reconnect": True,
+                     "auto_resync": True, "keep_playing": True,
+                     "resync_on_pause": True}
         self.outputs, self.sources = [], []
         self._loading = False
         self._load()
@@ -302,7 +311,11 @@ class MainWindow(QMainWindow):
         self.reconnect_failed = {}   # speaker name -> time it failed
         self.disconnecting = {}      # speaker name -> time Disconnect was pressed
         self.user_disconnected = set()   # disconnected on purpose: don't auto-reconnect them
+        self.dropout_count = 0       # speakers taken out of playback since Start was pressed
         self.last_auto = {}          # speaker name -> time of last automatic reconnect attempt
+        self._resyncing = False      # all speakers closed for a moment by _resync()
+        self.resync_after = {}       # rejoined speaker -> time it was first seen playing (or None)
+        self.resetting = set()       # speakers closed for a moment by _reset_speaker()
         self._tone_streams = []      # identify tones playing while stopped
         self._notice = ("", 0.0)     # short message kept in the status line until a time
 
@@ -319,6 +332,12 @@ class MainWindow(QMainWindow):
         self._restart_timer = QTimer(self)
         self._restart_timer.setSingleShot(True)
         self._restart_timer.timeout.connect(self._auto_restart)
+        self.guard = PauseGuard()       # before refresh_devices(), which tells it the speakers
+        self.guard.enabled = bool(self.opts["keep_playing"])
+        self.guard.switched_off.connect(self._speaker_switched_off)
+        self.guard.paused.connect(self._on_music_paused)
+        self.guard.checking.connect(self._on_guard_checking)
+        self._checking = False          # the pause guard is checking the speakers
         self.refresh_devices()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
@@ -328,6 +347,7 @@ class MainWindow(QMainWindow):
         self.monitor.reconnect_done.connect(self._on_reconnect_done)
         self.monitor.disconnect_done.connect(self._on_disconnect_done)
         self.monitor.start()
+        self.guard.start()
         if self.backend is None:
             self.status.setText("Audio system unavailable: " + self.backend_error)
 
@@ -476,15 +496,41 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.addWidget(QLabel("Safety buffer"))
         self.base = QSpinBox()
-        self.base.setRange(40, 500)
+        self.base.setRange(0, 500)
         self.base.setSuffix(" ms")
         self.base.setValue(int(self.opts["base_ms"]))
         self.base.setToolTip("Extra buffering before audio is sent to the speakers. "
-                             "Raise it if you hear dropouts; lower it for less lag.")
+                             "Raise it if you hear dropouts; lower it for less lag (at 0 ms "
+                             "only a minimal buffer of about 15 ms is kept).")
         self.base.valueChanged.connect(lambda x: self._opt("base_ms", x))
         row.addWidget(self.base)
         row.addStretch()
         v.addLayout(row)
+        cb = QCheckBox("Resync a speaker after it comes back")
+        cb.setToolTip("A speaker that returns after dropping out can end up slightly late. With this "
+                      "on, it reconnects silently; after %d s RoomCast closes just that speaker for "
+                      "%d s and brings it back in time, and only then does it play again. The others "
+                      "keep playing. If it is still out of step, press Resync."
+                      % (self.SETTLE_S, self.RESET_GAP_MS // 1000))
+        cb.setChecked(bool(self.opts["auto_resync"]))
+        cb.toggled.connect(lambda on: self.opts.__setitem__("auto_resync", on))
+        v.addWidget(cb)
+        cb = QCheckBox("Keep the music playing when a speaker is switched off")
+        cb.setToolTip("Many Bluetooth speakers tell the PC to pause as they switch off, which pauses "
+                      "your music on every speaker. With this on, when your music pauses RoomCast "
+                      "checks whether a speaker has just gone. If one has, the music plays on after "
+                      "a few seconds, and that speaker's sound moves to the others once Windows "
+                      "notices it has gone. Pausing on purpose, from a speaker's button or the PC, "
+                      "still works.")
+        cb.setChecked(bool(self.opts["keep_playing"]))
+        cb.toggled.connect(self._set_keep_playing)
+        v.addWidget(cb)
+        cb = QCheckBox("Resync the speakers whenever the music pauses")
+        cb.setToolTip("While nothing is playing, a resync can't be heard, so RoomCast uses every "
+                      "pause to line all the speakers up again.")
+        cb.setChecked(bool(self.opts["resync_on_pause"]))
+        cb.toggled.connect(lambda on: self.opts.__setitem__("resync_on_pause", on))
+        v.addWidget(cb)
         left.addWidget(g)
         left.addStretch()
         settings_w = QWidget()
@@ -505,8 +551,18 @@ class MainWindow(QMainWindow):
         self.start_btn.setObjectName("start")
         self.start_btn.setCheckable(True)
         self.start_btn.clicked.connect(self._toggle)
-        bottom.addWidget(self.start_btn)
-        self.status = hint("Stopped")
+        self.resync_btn = QPushButton("Resync")
+        self.resync_btn.setToolTip("Restart every speaker for a moment so they play in time again "
+                                   "(the same as pressing Stop and Start).")
+        self.resync_btn.clicked.connect(lambda: self._resync())
+        self.resync_btn.setEnabled(False)
+        self.resync_btn.setMinimumWidth(90)
+        self.resync_btn.setFixedHeight(self.start_btn.sizeHint().height())
+        row = QHBoxLayout()
+        row.addWidget(self.start_btn, 1)
+        row.addWidget(self.resync_btn)
+        bottom.addLayout(row)
+        self.status = hint(STOPPED)
         bottom.addWidget(self.status)
         lw = QWidget()
         lw.setLayout(bottom)
@@ -691,7 +747,7 @@ class MainWindow(QMainWindow):
         return e["hands_free"] if e else "hands-free" in name.lower()
 
     def _playable(self):
-        """Names the audio library can open right now (hands-free outputs excluded)."""
+        # Names the audio library can open right now (hands-free outputs excluded).
         return [d["name"] for d in self.outputs if not self._is_hands_free(d["name"])]
 
     def _list_names(self):
@@ -702,13 +758,13 @@ class MainWindow(QMainWindow):
         return names
 
     def _hands_free_only(self, e):
-        """True if the speaker's normal output is down but its call-mode output is up."""
+        # True if the speaker's normal output is down but its call-mode output is up.
         c = e.get("container")
         return bool(c) and not c.startswith("{00000000-") and any(
             x["hands_free"] and x["connected"] and x["container"] == c for x in self.endpoints.values())
 
     def refresh_devices(self):
-        """Re-scan devices. If playback is on, it continues with the new list."""
+        # Re-scan devices. If playback is on, it continues with the new list.
         resume = self.start_btn.isChecked()
         self._close_tones()             # the device re-scan below needs every stream closed
         self.engine.stop()
@@ -743,7 +799,7 @@ class MainWindow(QMainWindow):
         self._update_rows()
 
     def _add_new_rows(self):
-        """Add a row for every listable speaker that doesn't have one yet."""
+        # Add a row for every listable speaker that doesn't have one yet.
         for name in self._list_names():
             if name in self.rows:
                 continue
@@ -946,13 +1002,16 @@ class MainWindow(QMainWindow):
 
     def _toggle(self, on):
         if on:
+            self.dropout_count = 0      # counts from Start; resyncs and restarts keep it
             self._start()
         else:
             self._stop()
+            self.guard.pause_all()      # stopping RoomCast pauses the music on the computer too
 
     def _fail(self, msg, quiet=False):
         self.start_btn.setChecked(False)
         self.start_btn.setText("Start")
+        self.resync_btn.setEnabled(False)
         if quiet:
             self.status.setText("Stopped: " + msg.split("\n")[0])
         else:
@@ -961,9 +1020,11 @@ class MainWindow(QMainWindow):
     def _set_running_ui(self):
         self.start_btn.setChecked(True)
         self.start_btn.setText("Stop")
+        self.resync_btn.setEnabled(True)
 
-    def _start(self, quiet=False):
-        """quiet=True for automatic restarts: report problems in the status line, no pop-ups."""
+    def _start(self, quiet=False, skip_dropped=False):
+        """quiet=True for automatic restarts: report problems in the status line, no pop-ups.
+        skip_dropped=True leaves speakers that are out of playback closed (they rejoin as usual)."""
         if self.backend is None:
             return self._fail("The Windows audio system could not be loaded:\n" + self.backend_error, quiet)
         if not self.active:
@@ -985,7 +1046,8 @@ class MainWindow(QMainWindow):
                 "as the source, and try again.", quiet)
         by_name = {d["name"]: d for d in self.outputs}
         try:
-            failed = self.engine.start(src, [by_name[s.name] for s in self.active], self.mix())
+            skip = {k for k, s in enumerate(self.active) if s.name in self.dropped} if skip_dropped else ()
+            failed = self.engine.start(src, [by_name[s.name] for s in self.active], self.mix(), skip)
         except Exception as e:
             if quiet:                   # e.g. every speaker vanished mid-restart: retry shortly
                 for s in self.active:
@@ -998,6 +1060,9 @@ class MainWindow(QMainWindow):
                               "every ticked speaker is still connected." % e)
         self.engine.click_on = self.click.isChecked()
         self._set_running_ui()
+        log.info("playback started: %s%s", ", ".join(s.name for s in self.active),
+                 " (failed to open: %s)" % ", ".join(self.active[k].name for k in failed) if failed else "")
+        self._last_stats = time.monotonic()
         if failed:                      # play on the others; these rejoin by themselves later
             for k in failed:
                 self._mark_dropped(self.active[k].name)
@@ -1038,13 +1103,18 @@ class MainWindow(QMainWindow):
                     % (default["name"], src_name), 10)
 
     def _stop(self):
+        log.info("playback stopped")
         self._restart_timer.stop()
+        self._resyncing = False
+        self.resync_after.clear()
+        self.resetting.clear()
         self.engine.stop()
         self.dropped.clear()
         self.rejoin_fails.clear()
         self.start_btn.setChecked(False)
         self.start_btn.setText("Start")
-        self.status.setText("Stopped")
+        self.resync_btn.setEnabled(False)
+        self.status.setText(STOPPED)
         for m in getattr(self, "meters", []):
             m.setValue(0)
         self._update_rows()
@@ -1054,12 +1124,133 @@ class MainWindow(QMainWindow):
             self._schedule_restart(150)
 
     def _schedule_restart(self, ms):
-        """Restart playback (re-scanning devices) shortly. Repeated calls are merged."""
+        # Restart playback (re-scanning devices) shortly. Repeated calls are merged.
         self._restart_timer.start(ms)
 
     def _auto_restart(self):
-        if self.start_btn.isChecked():
+        if self.start_btn.isChecked() and not self._resyncing:
             self.refresh_devices()
+
+    RESYNC_GAP_MS = 1500    # long enough for Windows to close the Bluetooth audio links
+    RESUME_AFTER_RESYNC_MS = 700    # Bluetooth speakers swallow the first moment after waking
+    SETTLE_S = 3.5          # a returned speaker stays connected (silent) this long before its own reset ...
+    RESET_GAP_MS = 2000     # ... which closes it for this long
+
+    def _reset_speaker(self, name):
+        """Close one speaker for a moment and bring it back, while the others
+        keep playing (in Surround its channels fade over to them meanwhile).
+        Used once on a speaker that came back after a dropout: its Bluetooth
+        link was unsteady right after reconnecting and the speaker may have
+        grown its own buffer, leaving it late. A fresh start on a now-steady
+        link clears that."""
+        i = self.engine.index_of(name)
+        if i is None or not self.engine.is_open(i) or self._resyncing:
+            return
+        log.info("%s: resetting this speaker", name)
+        self.engine.drop(i)
+        self.resetting.add(name)
+        gen = self.engine._gen
+        self._update_rows()
+
+        def back():
+            if name not in self.resetting:
+                return
+            j = self.engine.index_of(name)
+            if (not self.engine.running or self.engine._gen != gen or j is None
+                    or name in self.dropped or not self.engine.rejoin(j)):
+                self.resetting.discard(name)    # stopped, restarted or gone meanwhile
+                self._update_rows()
+        QTimer.singleShot(self.RESET_GAP_MS, back)
+
+    def _on_guard_checking(self, on):
+        self._checking = on
+        self._update_rows()
+
+    def _on_music_paused(self):
+        if (self.opts["resync_on_pause"] and self.engine.running and self.start_btn.isChecked()
+                and not self._resyncing):
+            self._resync(on_pause=True)
+
+    def _resync(self, on_pause=False):
+        """Line every speaker up again by closing them all for a moment and
+        starting afresh, as Stop then Start does. A speaker that comes back
+        after a dropout can play slightly late even though RoomCast feeds it
+        on time, because audio queued up in its Bluetooth link; only closing
+        the link clears that.
+
+        on_pause: done because the music paused. Then there is no device
+        re-scan (it can hang while a speaker that was just switched off still
+        holds up Bluetooth), and speakers that are out stay out until they
+        rejoin as usual."""
+        if not self.start_btn.isChecked() or self._resyncing:
+            return
+        log.info("resync all speakers%s", " (the music paused)" if on_pause else "")
+        if not on_pause:
+            self.guard.pause_all(remember=True)     # resumed where it left off once restarted
+        self._resync_on_pause = on_pause
+        self._resyncing = True
+        self.resync_after.clear()
+        self.resetting.clear()
+        self._restart_timer.stop()
+        self._close_tones()
+        self.engine.stop(wait=0.5 if on_pause else 5.0)
+        for d in self.dropped.values():
+            d["rejoining"] = False      # a reopen under way is discarded by the stop: try again
+        self.resync_btn.setEnabled(False)
+        if not on_pause:                # on a pause, the speakers' rows say "Resyncing…" anyway
+            self._flash("Resyncing all speakers…", 4)
+        self._update_rows()
+        QTimer.singleShot(self.RESYNC_GAP_MS, self._finish_resync)
+
+    def _finish_resync(self):
+        if not self._resyncing:
+            return                      # stopped meanwhile
+        self._resyncing = False
+        if not self.start_btn.isChecked():
+            return
+        if getattr(self, "_resync_on_pause", False):
+            self._start(quiet=True, skip_dropped=True)
+        else:
+            self.refresh_devices()      # re-scans (picks up the returned speaker) and starts
+            if self.engine.running:     # give the speakers a moment to wake before the music
+                QTimer.singleShot(self.RESUME_AFTER_RESYNC_MS, self.guard.resume)
+
+    def _set_keep_playing(self, on):
+        self.opts["keep_playing"] = on
+        self.guard.enabled = on
+
+    def _speaker_switched_off(self, name):
+        """The pause guard found that this speaker has been switched off,
+        though Windows will only notice in a while. Take it out of playback
+        now (its channels move to the others); it rejoins once Windows has
+        seen it go and come back."""
+        if name in self.dropped or not self.start_btn.isChecked():
+            return
+        i = self.engine.index_of(name)
+        if i is not None and self.engine.is_open(i):
+            self._drop_now(name, gone=True, why="switched off: stopped answering after its pause")
+        elif self._resyncing:               # mid-resync: don't reopen it when playback restarts
+            log.info("%s: switched off during a resync, left out", name)
+            self.dropout_count += 1
+            self._mark_dropped(name)
+            self.dropped[name]["gone"] = True
+        else:
+            return
+        self.dropped[name]["switched_off"] = True
+        self.dropped[name]["await_off"] = time.monotonic()
+        self.resync_after.pop(name, None)
+        self._update_rows()
+
+    def _guard_speakers(self):
+        # Tell the pause guard which Bluetooth speakers are playing now.
+        res = {}
+        if self.engine.running:
+            for i, o in enumerate(self.engine.outs):
+                e = self.endpoints.get(o.name)
+                if (e and e.get("address") and e["connected"] and self.engine.is_open(i)
+                        and o.name not in self.dropped):
+                    res[o.name] = e["address"]
+        self.guard.set_speakers(res)
 
     # ---- dropouts and reconnecting --------------------------------------
     def _mark_dropped(self, name):
@@ -1070,8 +1261,12 @@ class MainWindow(QMainWindow):
         self.drop_history[name] = hist
         self.dropped[name] = {"t": now, "gone": False, "hold": min(10 * 2 ** (len(hist) - 1), 120)}
 
-    def _drop_now(self, name, gone=False):
-        """Take one speaker out of playback; the others keep playing."""
+    def _drop_now(self, name, gone=False, why=None):
+        # Take one speaker out of playback; the others keep playing.
+        log.info("%s: dropped (%s)", name, why or ("Windows says disconnected" if gone
+                                                   else "stopped taking audio"))
+        if name not in self.dropped and name not in self.user_disconnected:
+            self.dropout_count += 1             # one outage, however many ways it is noticed
         i = self.engine.index_of(name)
         if i is not None:
             self.engine.drop(i)                 # surround re-pans onto the others by itself
@@ -1087,8 +1282,8 @@ class MainWindow(QMainWindow):
         """Put a returning speaker back into playback without interrupting the
         others. Falls back to restarting playback when that isn't possible
         (e.g. it wasn't part of this playback session)."""
-        if not self.start_btn.isChecked():
-            self.dropped.pop(name, None)
+        if not self.start_btn.isChecked() or self._resyncing:
+            self.dropped.pop(name, None)        # a resync under way starts it with the others
             return
         e = self.endpoints.get(name)
         if e is not None and not e["connected"]:    # still off: wait until Windows sees it again
@@ -1100,16 +1295,36 @@ class MainWindow(QMainWindow):
         if i is not None:
             self.engine.drop(i)                 # a stream left over from before it disconnected
             if self.engine.rejoin(i):
+                log.info("%s: reopening", name)
                 self.dropped.setdefault(name, {"t": time.monotonic(), "gone": False, "hold": 10})
                 self.dropped[name]["rejoining"] = True
                 self._update_rows()
                 return
+        log.info("%s: can't rejoin in place, restarting playback", name)
         self.dropped.pop(name, None)
         self._schedule_restart(500)
+
+    def _log_pull_stats(self):
+        """Note in the log when a speaker asks for audio unevenly: the only
+        sign of trouble before Windows notices a lost Bluetooth link."""
+        now = time.monotonic()
+        dt = now - getattr(self, "_last_stats", now)
+        if dt < 1.0:
+            return
+        self._last_stats = now
+        quiet = now - getattr(self, "_last_full_stats", -1e9) < 30   # every 30 s, log everything
+        if not quiet:
+            self._last_full_stats = now
+        for name, gap, frames, rate in self.engine.pull_stats():
+            speed = frames / (rate * dt)
+            if not quiet or gap > 0.12 or abs(speed - 1.0) > 0.15:
+                log.info("%s: longest pause %.0f ms, took audio at %.0f%% speed",
+                         name, gap * 1000, speed * 100)
 
     def _check_dropouts(self):
         now = time.monotonic()
         if self.engine.running:
+            self._log_pull_stats()
             stalled = self.engine.stalled()
             for i in stalled:
                 self._drop_now(self.engine.outs[i].name)
@@ -1117,9 +1332,20 @@ class MainWindow(QMainWindow):
             for i, ok in self.engine.poll_rejoined():
                 changed = True
                 name = self.engine.outs[i].name
+                was_reset = name in self.resetting
+                self.resetting.discard(name)
+                log.info("%s: reopen %s%s", name, "ok" if ok else "failed",
+                         " (after its reset)" if was_reset else "")
                 if ok:
                     self.dropped.pop(name, None)
                     self.rejoin_fails.pop(name, None)
+                    # Back from a dropout: keep it silent until it has settled and had
+                    # its own reset, so it doesn't play late and then cut out again.
+                    # Back from that reset: let it play.
+                    hold = not was_reset and self.opts["auto_resync"]
+                    if hold:
+                        self.resync_after[name] = None
+                    self.engine.hold(i, hold)
                     continue
                 fails = self.rejoin_fails[name] = self.rejoin_fails.get(name, 0) + 1
                 gone = self.dropped.get(name, {}).get("gone", False)
@@ -1137,6 +1363,23 @@ class MainWindow(QMainWindow):
                     self.dropped[name]["gone"] = gone
             if changed:
                 self._update_rows()
+            # A returned speaker that has played steadily for a while gets one short
+            # reset of its own, which clears the extra lag it picked up while its
+            # link was still unsteady. The others keep playing.
+            for name, t in list(self.resync_after.items()):
+                i = self.engine.index_of(name)
+                if i is None or not self.engine.is_open(i) or not self.opts["auto_resync"]:
+                    del self.resync_after[name]         # dropped again, or switched off
+                    if i is not None and self.engine.is_open(i):
+                        self.engine.hold(i, False)      # switched off: play it as it is
+                    self._update_rows()
+                elif not self.engine.is_playing(i):
+                    self.resync_after[name] = None
+                elif t is None:
+                    self.resync_after[name] = now
+                elif now - t >= self.SETTLE_S:
+                    del self.resync_after[name]
+                    self._reset_speaker(name)
         for name, d in list(self.dropped.items()):
             if not d["gone"] and not d.get("rejoining") and now - d["t"] > d["hold"]:
                 self._try_rejoin(name)          # never actually disconnected: try it again
@@ -1159,7 +1402,10 @@ class MainWindow(QMainWindow):
                 continue                        # no connection info: the time-out retries it
             if not e["connected"]:
                 d["gone"] = True
+                d.pop("await_off", None)
             elif d["gone"]:
+                if now - d.get("await_off", -1e9) < 40:
+                    continue                    # switched off, but Windows hasn't noticed yet
                 returned.add(name)              # back again
         for name, t in list(self.disconnecting.items()):
             e = self.endpoints.get(name)
@@ -1185,11 +1431,14 @@ class MainWindow(QMainWindow):
             checked = set(self.checked)
             came_up = ((up(self.endpoints) - up(old)) & checked) | returned
             for name in (up(old) - up(self.endpoints)) & checked:
+                if self.dropped.get(name, {}).get("switched_off"):
+                    continue                        # already taken out when it was switched off
                 self._drop_now(name, gone=True)
             for name in came_up:
                 i = self.engine.index_of(name)
                 if name not in returned and i is not None and self.engine.is_open(i):
                     continue                        # already playing (e.g. first poll after launch)
+                log.info("%s: back, rejoining in 2 s", name)
                 self._schedule_rejoin(name, 2000)   # let a fresh Bluetooth link settle first
             if shape(old) != shape(self.endpoints):
                 self._add_new_rows()                # ticking one restarts playback to open it
@@ -1265,7 +1514,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(int(TONE_TOTAL_S * 1000), lambda: self._close_tone(stream))
 
     def _flash(self, text, seconds=6.0):
-        """Show a message in the status line for a few seconds, even while playing."""
+        # Show a message in the status line for a few seconds, even while playing.
         self._notice = (text, time.monotonic() + seconds)
         self.status.setText(text)
 
@@ -1288,7 +1537,7 @@ class MainWindow(QMainWindow):
         self.monitor.poll_now()
 
     def _row_state(self, name):
-        """(text, colour, show Reconnect, Reconnect enabled) for one speaker row."""
+        # (text, colour, show Reconnect, Reconnect enabled) for one speaker row.
         e = self.endpoints.get(name)
         is_bt = bool(e and e["bluetooth"])
         now = time.monotonic()
@@ -1307,22 +1556,42 @@ class MainWindow(QMainWindow):
             if self.start_btn.isChecked() and name in self.checked and self.opts["auto_reconnect"]:
                 return "Disconnected. RoomCast keeps trying to reconnect it.", RED, True, True
             return "Disconnected (paired). Switch it on or press Reconnect.", GREY, True, True
+        if name in self.resetting and name not in self.dropped:
+            return "Resyncing this speaker…", AMBER, False, True
+        if self._switched_off(name):
+            return "Turned off. Its sound moved to the other speakers.", AMBER, False, True
+        playing = self.engine.running and any(o.name == name for o in self.engine.outs)
+        if name not in self.dropped and name in self.checked and self.start_btn.isChecked() and (
+                self._resyncing or (self._checking and playing)):
+            # All speakers restarting (or, after a pause, being checked for one
+            # that was switched off): don't flash "Joining…" / "Playing" meanwhile.
+            return "Resyncing…", AMBER, False, True
+        if name in self.resync_after and name not in self.dropped:
+            return "Back. Stabilizing connection…", AMBER, False, True
         if name in self.dropped:
             if self.dropped[name].get("rejoining"):
                 return "Back. Rejoining playback…", AMBER, False, True
             return "Dropped out. It rejoins automatically when it's back.", AMBER, is_bt, True
-        if self.engine.running and any(o.name == name for o in self.engine.outs):
+        if playing:
             return "Playing", GREEN, False, True
         if name in self.checked and self.start_btn.isChecked():
             return "Connected. Joining…", AMBER, False, True
         return "Connected" + (" · Bluetooth" if is_bt else ""), GREEN if is_bt else GREY, False, True
 
+    def _switched_off(self, name):
+        # Turned off (found by the pause guard) but Windows doesn't know yet.
+        e = self.endpoints.get(name)
+        return bool(e is not None and e["connected"] and name in self.dropped
+                    and self.dropped[name].get("switched_off"))
+
     def _update_rows(self):
+        self._guard_speakers()
         for name, row in self.rows.items():
             text, color, show, enabled = self._row_state(name)
             e = self.endpoints.get(name)
             can_disconnect = bool(e and e["bluetooth"] and e["connected"] and not e["hands_free"]
-                                  and name not in self.disconnecting)
+                                  and name not in self.disconnecting
+                                  and not self._switched_off(name))   # can't reach it while off
             row.set_state(text, color, show, enabled, can_disconnect)
             is_bt = bool(e and e["bluetooth"])
             row.set_battery(self.battery.get(e["container"]) if is_bt else None,
@@ -1342,6 +1611,8 @@ class MainWindow(QMainWindow):
             return self.status.setText(self._notice[0])
         playing = len(self.engine.outs) - len(self.engine.stalled())
         waiting = [n for n in self.checked if n not in [o.name for o in self.engine.outs]]
-        self.status.setText("Running · %d speaker(s) playing%s · source %d ch @ %d Hz · dropouts: %d" % (
+        self.status.setText("Running · %d speaker(s) playing%s · source %d ch @ %d Hz\n"
+                            "Speaker dropouts: %d · buffer gaps: %d%s" % (
             playing, " · %d waiting to reconnect" % len(waiting) if waiting else "",
-            self.engine.n_in, self.engine.src_rate, self.engine.underruns()))
+            self.engine.n_in, self.engine.src_rate, self.dropout_count, self.engine.underruns(),
+            " · RoomCast %s" % VERSION if VERSION else ""))

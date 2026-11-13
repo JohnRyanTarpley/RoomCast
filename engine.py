@@ -65,7 +65,7 @@ TONE_TOTAL_S = TONE_LEAD_S + 0.5 + 0.4
 
 
 class SpeakerOut:
-    """Delay line + drift-correcting resampler feeding one output device."""
+    # Delay line + drift-correcting resampler feeding one output device.
 
     CAP_S = 4.0
     JUMP_S = 0.04       # further than this from the target delay ...
@@ -92,10 +92,13 @@ class SpeakerOut:
         self.t_ok = time.perf_counter()   # last time the delay was close to the target
         self.volume = 1.0
         self.mute = False
+        self.held = False     # kept silent until the GUI has resynced it (see Engine.hold)
         self.peak = 0.0
         self.underruns = 0
         self.beep = None
         self.t_pull = time.perf_counter()   # last time the device asked for audio
+        self.max_gap = 0.0    # longest time between two requests for audio (see pull_stats)
+        self.pulled = 0       # frames requested since pull_stats was last called
         self.lock = threading.Lock()
 
     def reset(self):
@@ -162,9 +165,14 @@ class SpeakerOut:
             return out
 
     def pull(self, n_out):
-        self.t_pull = time.perf_counter()
+        now = time.perf_counter()
+        gap = now - self.t_pull
+        if gap > self.max_gap:
+            self.max_gap = gap
+        self.pulled += n_out
+        self.t_pull = now
         out = self._read(n_out)
-        out = out * (0.0 if self.mute else self.volume)
+        out = out * (0.0 if self.mute or self.held else self.volume)
         beep = self.beep
         if beep is not None:
             k = min(len(beep), n_out)
@@ -208,31 +216,63 @@ class Engine:
         self._rejoined = []           # (speaker index, stream or None)
         self._warming = set()         # rejoined speakers not yet given their surround channels
         self._fade = None             # [matrix faded from, matrix faded to, progress 0..1]
+        self._closing = []            # threads closing dropped speakers' streams (see drop())
 
     # ---- lifecycle ---------------------------------------------------
-    def start(self, source: dict, outputs: list, settings: MixSettings):
+    OPEN_TIMEOUT_S = 4.0    # speakers not open by then are left out (they can rejoin later)
+
+    def start(self, source: dict, outputs: list, settings: MixSettings, skip=()):
         """Start playing. A speaker that cannot be opened is skipped (its
         index is returned) so the others still play; raises only if no
-        speaker or the source cannot be opened."""
-        self.stop()
+        speaker or the source cannot be opened. Speakers whose index is in
+        `skip` are not opened at all (and not returned); rejoin() can open
+        them later.
+
+        Speakers are opened on a background thread: while Windows is still
+        trying to reach a Bluetooth speaker that was switched off, opening
+        any Bluetooth speaker can hang for many seconds. Those not open
+        after OPEN_TIMEOUT_S count as failed; if one opens later it is closed."""
+        self.stop(wait=0.0)
         self.src_rate = int(source["rate"])
         self.n_in = int(source["channels"])
         self.outs = [SpeakerOut(o["name"], self.src_rate, int(o["rate"])) for o in outputs]
         self._dev_rates = [int(o["rate"]) for o in outputs]
         self._devs = list(outputs)
         self._filters = [None] * len(self.outs)
+        self._out_streams = [None] * len(outputs)
         self.apply(settings)
         self.running = True
-        failed, first_error = [], None
-        for i, (o, dev) in enumerate(zip(self.outs, outputs)):
-            try:
-                self._out_streams.append(self.backend.open_output(
-                    dev["index"], int(dev["rate"]), int(dev["channels"]), o.pull))
-            except Exception as e:
-                self._out_streams.append(None)
-                failed.append(i)
-                first_error = first_error or e
-        if outputs and len(failed) == len(outputs):
+        todo = [i for i in range(len(outputs)) if i not in skip]
+        opened, errors, gen, late = {}, {}, self._gen, set()
+
+        def open_all():
+            for i in todo:
+                o, dev = self.outs[i], outputs[i]
+                try:
+                    s = self.backend.open_output(dev["index"], int(dev["rate"]), int(dev["channels"]),
+                                                 o.pull)
+                except Exception as e:
+                    errors[i] = e
+                    continue
+                with self._lock:
+                    if gen == self._gen and i not in late:
+                        opened[i] = s
+                        continue
+                self._close(s)          # too late (or stopped meanwhile)
+
+        t = threading.Thread(target=open_all, name="open", daemon=True)
+        t.start()
+        t.join(self.OPEN_TIMEOUT_S)
+        with self._lock:
+            for i, s in opened.items():
+                self._out_streams[i] = s
+            failed = [i for i in todo if i not in opened]
+            late.update(failed)
+        if t.is_alive():
+            self._closing.append(t)     # stop() waits for it before a device re-scan
+        first_error = next((errors[i] for i in failed if i in errors),
+                           TimeoutError("the speakers took too long to open"))
+        if todo and len(failed) == len(todo):
             self.stop()
             raise first_error
         if failed:
@@ -249,17 +289,28 @@ class Engine:
         threading.Thread(target=self._click_loop, daemon=True).start()
         return failed
 
-    def stop(self):
+    def stop(self, wait=5.0):
+        """Stop playing. Waits up to `wait` s for streams still being opened
+        or closed: a device re-scan (backend.refresh) needs them finished."""
         self.running = False
         with self._lock:
             self._gen += 1
             late, self._rejoined = [s for _, s in self._rejoined], []
-        for t in self._pending.values():    # the device re-scan after a stop needs them finished
-            t.join(timeout=5.0)
+        # Close the speakers on a thread of their own: closing a Bluetooth
+        # speaker's stream can hang while Windows is still trying to reach it.
+        streams = [s for s in self._out_streams + late if s is not None]
+        if streams:
+            t = threading.Thread(target=lambda: [self._close(s) for s in streams],
+                                 name="close", daemon=True)
+            t.start()
+            self._closing.append(t)
+        self._close(self._capture)
+        deadline = time.perf_counter() + wait
+        for t in list(self._pending.values()) + self._closing:
+            t.join(timeout=max(0.0, deadline - time.perf_counter()))
         self._pending = {}
+        self._closing = [t for t in self._closing if t.is_alive()]
         self._warming = set()
-        for s in self._out_streams + [self._capture] + late:
-            self._close(s)
         self._out_streams = []
         self._capture = None
         self.outs = []
@@ -283,18 +334,37 @@ class Engine:
 
     def drop(self, i):
         """Close one speaker's stream; the other speakers keep playing (in
-        surround, its channels are re-panned onto them)."""
+        surround, its channels are re-panned onto them). The stream is closed
+        on a thread of its own: closing a Bluetooth speaker's stream can hang
+        for half a minute while Windows is still trying to reach it."""
         if 0 <= i < len(self._out_streams) and self._out_streams[i] is not None:
             s, self._out_streams[i] = self._out_streams[i], None
             self._warming.discard(i)
-            self._close(s)
             self._reapply()
+            self._closing = [t for t in self._closing if t.is_alive()]
+            t = threading.Thread(target=self._close, args=(s,), name="close", daemon=True)
+            self._closing.append(t)
+            t.start()
 
     def index_of(self, name):
         return next((i for i, o in enumerate(self.outs) if o.name == name), None)
 
     def is_open(self, i):
         return 0 <= i < len(self._out_streams) and self._out_streams[i] is not None
+
+    def is_playing(self, i):
+        # True once a speaker is open, taking audio and past its warm-up.
+        return self.is_open(i) and self.outs[i].primed and i not in self._warming
+
+    def hold(self, i, on):
+        """Keep an open speaker silent (it still takes audio, so it stays
+        connected and in time) or let it play again. Used on a speaker that
+        came back after a dropout until its own resync has run, so it doesn't
+        cut in late and then cut out for the resync. In surround, its channels
+        stay on the other speakers meanwhile."""
+        if 0 <= i < len(self.outs) and self.outs[i].held != on:
+            self.outs[i].held = on
+            self._reapply()
 
     def rejoin(self, i):
         """Reopen a dropped speaker in the background while the others keep
@@ -362,7 +432,8 @@ class Engine:
             # Pan only onto speakers that are playing, so a dropped speaker's
             # channels aren't lost. Delay and level compensation still use every
             # speaker, so the others' timing doesn't move when one drops out.
-            live = [i for i in range(n) if self.is_open(i) and i not in self._warming] or list(range(n))
+            live = [i for i in range(n) if self.is_open(i) and i not in self._warming
+                    and not self.outs[i].held] or list(range(n))
             G = np.zeros((n, len(az)), np.float32)
             G[live] = dsp.pan_gains([pos[i] for i in live], st.listener, az, st.focus)
             dist = dsp.distances(pos, st.listener)
@@ -457,6 +528,18 @@ class Engine:
                 o.beep = beep_tone(rate)
                 return True
         return False
+
+    def pull_stats(self):
+        """Per open speaker: (name, longest gap between requests for audio in s,
+        frames requested per second of its device rate) since the last call.
+        Only for the diagnostic log."""
+        res = []
+        for i, o in enumerate(self.outs):
+            gap, frames = o.max_gap, o.pulled
+            o.max_gap, o.pulled = 0.0, 0
+            if self.is_open(i):
+                res.append((o.name, gap, frames, self._dev_rates[i]))
+        return res
 
     def levels(self):
         lv = []

@@ -5,10 +5,13 @@ import sys
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
+import diag
 from ui import MainWindow, apply_theme
 
 
 def main():
+    diag.setup()
+    diag.log.info("RoomCast started")
     # Own taskbar identity, so Windows shows RoomCast's icon instead of Python's.
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("RoomCast")
     app = QApplication(sys.argv)

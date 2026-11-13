@@ -1,4 +1,4 @@
-"""Orbitable 3D room view for placing speakers and the listener."""
+# Orbitable 3D room view for placing speakers and the listener.
 from __future__ import annotations
 
 import math

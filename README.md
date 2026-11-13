@@ -21,9 +21,7 @@ speakers at once, in one of three modes:
    console window.
 
 `RoomCast.exe` is a small launcher that runs `Run RoomCast.bat`. It must stay in
-the RoomCast folder. To rebuild it after changing `launcher/RoomCast.cs`, run
-`launcher\build.bat` (no extra tools needed; it uses the C# compiler built into
-Windows). Put a `RoomCast.ico` in `launcher/` before building to give it an icon.
+the RoomCast folder.
 
 ## Using it
 
@@ -59,29 +57,54 @@ Windows). Put a `RoomCast.ico` in `launcher/` before building to give it an icon
 True 5.1/7.1 input is used when the source device is configured for it in
 Windows; stereo sources are upmixed (optional).
 
-**Connection problems are handled for you:**
+**When a speaker drops out or is turned off:**
 
-- If a speaker drops out while playing, the others keep going without a
-  break. In Surround mode its channels fade over to them, and fade back once
-  it is playing again. The speaker rejoins automatically, in time with the
-  others, when Windows sees it again, with its delay and position kept.
-- Short pauses on one speaker (common when a phone is also connected to it,
-  even if the phone isn't playing anything) are ridden out without resyncing
-  or restarting anything. For the most reliable playback, disconnect phones
-  from the speakers RoomCast uses.
-- While playing, RoomCast asks Windows to reconnect ticked speakers that have
-  disconnected, every 30 seconds (can be switched off).
-- Speakers with a microphone show up in Windows twice; RoomCast hides the
-  low-quality "Hands-Free" (phone call) output and warns when a speaker is
-  stuck in that mode.
+- The other speakers keep playing. In Surround mode, its channels move over
+  to them.
+- If turning a speaker off pauses your music, RoomCast starts it again on
+  the remaining speakers within a few seconds. Pausing on purpose still
+  pauses.
+- When the speaker comes back, it rejoins by itself with its delay and
+  position kept, and stays silent until it is in time with the others.
+- RoomCast reconnects ticked speakers that have disconnected.
+- All speakers are resynced whenever the music pauses. If they still sound
+  out of step, press **Resync**: it pauses the music, lines the speakers up
+  and carries on where it left off.
+- Pressing **Stop** also pauses the music on your PC.
 
-Many built-in Bluetooth adapters struggle with more than 2–3 speakers playing
-at once, and Windows uses only one adapter at a time. A good USB Bluetooth
-5.x adapter helps if speakers keep dropping out.
+Most of these can be switched off with the checkboxes in RoomCast.
 
-Expect roughly a quarter to half a second between the PC and the speakers.
-That is fine for music, but video will be out of lip-sync unless the player
-has an audio-offset setting.
+**Tips:**
+
+- Disconnect phones from the speakers RoomCast uses. A connected phone, even
+  an idle one, causes short dropouts.
+- Built-in Bluetooth adapters often struggle with more than 2–3 speakers. A
+  good USB Bluetooth 5.x adapter helps if speakers keep dropping out.
+- Speakers with a microphone show up twice in Windows. RoomCast hides the
+  low-quality "Hands-Free" output and warns if a speaker is stuck in it.
+
+### Video and lip-sync
+
+Expect roughly a quarter to half a second between the PC and the speakers:
+the **Safety buffer** (120 ms by default, can be set as low as 0 ms if your
+speakers play without dropouts) plus each speaker's own Bluetooth lag, which
+RoomCast can't change. That is fine for music. For video it is not a
+Bluetooth limit as such: when you play to a single Bluetooth speaker, Windows
+tells the video player about the lag and the player holds the picture back.
+Here the player only sees the source device, so it doesn't know about the
+delay. Workarounds:
+
+- **VLC:** Tools > Track Synchronization, set the audio track
+  synchronization to a negative value (start at -0.350 s), or press **J** to
+  adjust while watching. To keep it, set **Audio desynchronization
+  compensation** (Tools > Preferences > All > Audio) to the same value in ms.
+- **mpv:** add `audio-delay=-0.35` to `mpv.conf`, or adjust with
+  **Ctrl + −** / **Ctrl + +**. With yt-dlp installed, mpv also plays YouTube
+  links directly (`mpv <link>`), with the offset applied.
+- **MPC-HC:** Options > Internal Filters > Audio Switcher > time shift.
+- **Browsers, streaming apps and games** have no such setting. Lower the
+  Safety buffer as far as your speakers allow, or play them straight to one
+  speaker instead. Games can't hold the picture back in any case.
 
 ## Architecture
 
@@ -107,6 +130,8 @@ has an audio-offset setting.
 | `backend.py` | WASAPI device listing, loopback capture and output streams (PyAudioWPatch). |
 | `bluetooth.py` | Windows device APIs: endpoint state incl. disconnected paired speakers and hands-free detection (Core Audio via ctypes), one-shot Bluetooth reconnect (`IKsControl`), battery level (`cfgmgr32`), scanning and pairing (WinRT via `winrt-*`). No drivers or admin rights. |
 | `connection.py` | `DeviceMonitor` (background polling: state every 2 s, battery every 30 s; runs reconnects off the GUI thread) and the pairing dialog. |
+| `pauseguard.py` | Watches media apps: resumes the music when a speaker switching off paused it, triggers the resync on pause, and pauses the music when RoomCast is stopped. |
+| `diag.py` | Diagnostic log of connection events. |
 
 Key design points:
 
@@ -140,6 +165,25 @@ Key design points:
   twice does the window restart playback to re-scan devices (at most once
   every 5 minutes per speaker); otherwise a speaker that keeps failing is
   retried less often each time (10 s up to 2 min).
+- **Resync.** A rejoined speaker can be late from lag inside its Bluetooth
+  link, which the ring buffer can't see. So it is held silent
+  (`Engine.hold`) until it has played steadily for `SETTLE_S`, then reset
+  once on its own (`MainWindow._reset_speaker`). The Resync button and every
+  music pause (`PauseGuard.paused`) restart all speakers
+  (`MainWindow._resync`).
+- **Switched-off speakers (`pauseguard.py`).** Many speakers send a pause
+  (AVRCP) as they switch off, and Windows only notices the speaker is gone
+  after a ~20 s link timeout, during which Bluetooth to the other speakers
+  stalls too. On a pause, `PauseGuard` sends each speaker a live Bluetooth
+  query, one at a time. If every speaker answers, the pause was meant. If one
+  answers and the next hangs, the one that hung is dropped at once. Either
+  way the music is resumed, and the restart on pause frees the other
+  speakers within about 4 s.
+- **Nothing blocks the window.** Opening and closing streams run on
+  background threads (`Engine.start`, `Engine.stop`, `Engine.drop`), since
+  they can hang for many seconds while Bluetooth is stalled.
+- **Diagnostic log.** Connection events go to `%APPDATA%\RoomCast\roomcast.log`
+  (`diag.py`).
 - **Unrelated device changes don't interrupt playback.** Endpoints that come
   and go without affecting playback (another speaker, a hands-free endpoint
   flickering because a phone connected to a speaker) just update the list.

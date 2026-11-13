@@ -59,7 +59,7 @@ class WasapiBackend:
         self.p = pa.PyAudio()
 
     def refresh(self):
-        """Re-scan devices. All streams must be closed first."""
+        # Re-scan devices. All streams must be closed first.
         self.p.terminate()
         self.p = self.pa.PyAudio()
 

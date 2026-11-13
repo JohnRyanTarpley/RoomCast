@@ -76,7 +76,7 @@ BT_ENUMERATORS = ("BTHENUM", "BTHHFENUM", "BTHLEDEVICE", "BTHLE")
 
 
 def _vcall(obj, index, argtypes, *args):
-    """Call method number `index` of the COM object pointer `obj`."""
+    # Call method number `index` of the COM object pointer `obj`.
     fn_addr = ctypes.cast(obj, POINTER(POINTER(c_void_p)))[0][index]
     fn = ctypes.WINFUNCTYPE(HRESULT, c_void_p, *argtypes)(fn_addr)
     return fn(obj, *args)
@@ -299,6 +299,28 @@ def battery_levels():
     return res
 
 
+def bluetooth_addresses():
+    """{container id: Bluetooth address (int)} for every present classic
+    Bluetooth device. The container id is the one list_endpoints() reports,
+    so this links a speaker's audio endpoint to its radio address."""
+    res = {}
+    for inst in _present_ids("BTHENUM"):
+        head = inst.split("\\")
+        if len(head) < 2 or not head[1].upper().startswith("DEV_"):
+            continue
+        try:
+            addr = int(head[1][4:], 16)
+        except ValueError:
+            continue
+        devinst = c_ulong()
+        if _cfg.CM_Locate_DevNodeW(byref(devinst), inst, 0) != 0:
+            continue
+        _, cdata = _devnode_prop(devinst, PKEY_Device_ContainerId)
+        if cdata and len(cdata) >= 16:
+            res[str(GUID.from_buffer_copy(cdata[:16]))] = addr
+    return res
+
+
 # ------------------------------------------------------------------ pairing
 # Uses the Windows Runtime device APIs through the optional `winrt` packages.
 
@@ -398,7 +420,7 @@ async def scan_for_speakers(seconds, on_found, should_stop=lambda: False):
 
 
 async def pair(device_id):
-    """Pair with a speaker found by scan_for_speakers. Returns (ok, message)."""
+    # Pair with a speaker found by scan_for_speakers. Returns (ok, message).
     from winrt.windows.devices.enumeration import (DeviceInformation, DeviceInformationKind,
                                                    DevicePairingKinds, DevicePairingResultStatus)
 
